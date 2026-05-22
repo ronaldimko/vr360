@@ -60,15 +60,16 @@ android {
 }
 
 dependencies {
-    implementation("androidx.core:core-ktx:1.17.0")
+    implementation("androidx.core:core-ktx:1.18.0")
     implementation("androidx.appcompat:appcompat:1.7.1")
-    implementation("com.google.android.material:material:1.13.0")
+    implementation("com.google.android.material:material:1.14.0")
     implementation("androidx.constraintlayout:constraintlayout:2.2.1")
 
     implementation("com.google.cardboard.sdk:sdk:1.21.0@aar")
 
     implementation("com.google.android.gms:play-services-vision:20.1.3")
-    implementation("com.google.protobuf:protobuf-javalite:4.33.0")
+    implementation("com.google.protobuf:protobuf-javalite:4.35.0")
+    implementation("com.squareup.okhttp3:okhttp:5.3.2")
 
     // Главное добавление: LibVLC для RTP/UDP multicast
     implementation("org.videolan.android:libvlc-all:3.7.0")

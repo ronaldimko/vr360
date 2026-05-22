@@ -16,7 +16,7 @@
 #include "glm/vec3.hpp"
 #include "glm/vec4.hpp"
 #include "glm/mat4x4.hpp"
-#define GLM_ENABLE_EXPERIMENTAL // quaternion.hpp is an experimental extension in GLM
+#define GLM_ENABLE_EXPERIMENTAL
 #include "glm/gtx/quaternion.hpp"
 #include "glm/gtx/matrix_operation.hpp"
 #include "glm/ext/matrix_transform.hpp"
@@ -105,9 +105,21 @@ static constexpr glm::vec3 Y_AXIS = {0.0f, 1.0f, 0.0f};
 static constexpr glm::vec4 NEG_Z_AXIS = {0.0f, 0.0f, -1.0f, 1.0f};
 
 static constexpr std::array<float, 3> pointerCoords = {0.0f, 0.0f, VR_GUI_DISTANCE};
-static constexpr std::array<float, 6> cardboardAlignLineCoords = {0.0f, -0.2f, 0.5f, 0.0f, -1.0f,
-                                                                  0.5f};
+static constexpr std::array<float, 6> cardboardAlignLineCoords = {
+        0.0f, -0.2f, 0.5f,
+        0.0f, -1.0f, 0.5f
+};
+
 static constexpr GLubyte trivial2DData[] = {0, 1};
+
+/*
+ * ВАЖНО:
+ * Делаем file-scope флаг, чтобы не менять Renderer.h.
+ *
+ * true  — есть Cardboard QR, используем Cardboard distortion.
+ * false — QR нет, но всё равно рисуем два глаза split-screen без distortion.
+ */
+static bool gCardboardReady = false;
 
 static std::array<VRGuiButton, 10> vrGuiButtons{
         VRGuiButton(M_PI - 1 * VR_GUI_BUTTON_GRID, VR_GUI_BUTTON_PHI_0 - 1 * VR_GUI_BUTTON_GRID,
@@ -142,12 +154,20 @@ static std::array<VRGuiButton, 10> vrGuiButtons{
                     ButtonBehavior::DELAYED_TRIGGER, true)
 };
 
-static VRGuiProgressBar vrGuiProgressBar(0, 3 * VR_GUI_BUTTON_GRID, 6 * VR_GUI_BUTTON_GRID,
-                                         0.5f * VR_GUI_BUTTON_GRID);
+static VRGuiProgressBar vrGuiProgressBar(
+        0,
+        3 * VR_GUI_BUTTON_GRID,
+        6 * VR_GUI_BUTTON_GRID,
+        0.5f * VR_GUI_BUTTON_GRID
+);
+
 static time_t vrGuiProgressBarHideAt;
 
-Renderer::Renderer(JavaVM *vm, jobject javaContextObj, jobject javaAssetMgrObj,
-                   jobject javaVideoTexturePlayerObj, jobject javaControllerObj)
+Renderer::Renderer(JavaVM *vm,
+                   jobject javaContextObj,
+                   jobject javaAssetMgrObj,
+                   jobject javaVideoTexturePlayerObj,
+                   jobject javaControllerObj)
         : glInitialized(false),
           screenParamsChanged(false),
           deviceParamsChanged(false),
@@ -158,7 +178,8 @@ Renderer::Renderer(JavaVM *vm, jobject javaContextObj, jobject javaAssetMgrObj,
           eyeMeshes{},
           viewMatrix{},
           cardboardHeadTracker{},
-          javaInterface(vm, javaContextObj, javaAssetMgrObj, javaVideoTexturePlayerObj, javaControllerObj) {
+          javaInterface(vm, javaContextObj, javaAssetMgrObj, javaVideoTexturePlayerObj,
+                        javaControllerObj) {
     LOG_DEBUG("Renderer instance created");
 
     Cardboard_initializeAndroid(vm, javaContextObj);
@@ -184,12 +205,39 @@ void Renderer::SetManualRotation(float yawValue, float pitchValue, float rollVal
     manualRoll = rollValue;
 }
 
+void Renderer::LookAtPoint(float yawDeg, float pitchDeg, float fovDeg, int durationMs) {
+    useLookAtControl = true;
+
+    startYaw = controlYaw;
+    startPitch = controlPitch;
+    startFov = controlFov;
+
+    targetYaw = glm::radians(yawDeg);
+    targetPitch = glm::radians(pitchDeg);
+    targetFov = fovDeg;
+
+    targetYaw = NormalizeAngle(targetYaw);
+    targetPitch = glm::clamp(targetPitch, glm::radians(-85.0f), glm::radians(85.0f));
+    targetFov = glm::clamp(targetFov, 35.0f, 120.0f);
+
+    lookAtDurationMs = durationMs <= 0 ? 1 : static_cast<uint64_t>(durationMs);
+    lookAtStartMs = GetBootTimeNano() / 1000000ULL;
+    lookAtAnimating = true;
+
+    LOG_DEBUG(
+            "LookAtPoint yawDeg=%.2f pitchDeg=%.2f fovDeg=%.2f durationMs=%d",
+            yawDeg,
+            pitchDeg,
+            fovDeg,
+            durationMs
+    );
+}
+
 void Renderer::OnResume() {
     LOG_DEBUG("OnResume");
 
     frameCount = 0;
 
-    // Parameters may have changed.
     deviceParamsChanged = true;
 
     CardboardHeadTracker_resume(cardboardHeadTracker.get());
@@ -204,8 +252,10 @@ void Renderer::SetScreenParams(int width, int height) {
     screenParamsChanged = true;
 }
 
-static void
-initStaticTexture(JNIEnv *env, jobject java_asset_mgr, GLuint &textureId, const std::string &path) {
+static void initStaticTexture(JNIEnv *env,
+                              jobject java_asset_mgr,
+                              GLuint &textureId,
+                              const std::string &path) {
     glGenTextures(1, &textureId);
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, textureId);
@@ -214,10 +264,12 @@ initStaticTexture(JNIEnv *env, jobject java_asset_mgr, GLuint &textureId, const 
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+
     if (!LoadPngFromAssetManager(env, java_asset_mgr, GL_TEXTURE_2D, path)) {
         LOG_ERROR("Couldn't load texture");
         return;
     }
+
     glGenerateMipmap(GL_TEXTURE_2D);
 
     CHECK_GL_ERROR("Texture load");
@@ -237,6 +289,7 @@ void Renderer::InitVideoTexture(JNIEnv *env, GLuint &textureId) {
         LOG_ERROR("Couldn't initialize video texture");
         return;
     }
+
     CHECK_GL_ERROR("Video texture init");
 }
 
@@ -249,10 +302,12 @@ void Renderer::InitStaticTexture(JNIEnv *env, GLuint &textureId, const std::stri
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+
     if (!javaInterface.LoadPngFromAssetManager(env, GL_TEXTURE_2D, path)) {
         LOG_ERROR("Couldn't load texture");
         return;
     }
+
     glGenerateMipmap(GL_TEXTURE_2D);
 
     CHECK_GL_ERROR("Texture load");
@@ -316,45 +371,65 @@ void Renderer::DrawFrame(float videoPosition, JNIEnv *env) {
     }
 
     UpdatePose(env);
+    UpdateLookAtAnimation();
 
     int minEye, maxEye;
     GLsizei eyeWidth;
+
     switch (outputMode) {
         case OutputMode::MONO_LEFT:
             minEye = 0;
             maxEye = 0;
             eyeWidth = screenWidth;
             break;
+
         case OutputMode::MONO_RIGHT:
             minEye = 1;
             maxEye = 1;
             eyeWidth = screenWidth;
             break;
+
         case OutputMode::CARDBOARD_STEREO:
             minEye = 0;
             maxEye = 1;
             eyeWidth = screenWidth / 2;
             break;
+
         default:
             assert(false);
     }
 
-    if (outputMode == OutputMode::CARDBOARD_STEREO) {
+    /*
+     * Если Cardboard QR есть — рисуем оба глаза в framebuffer,
+     * потом применяем Cardboard distortion.
+     *
+     * Если QR нет — рисуем сразу на экран двумя половинами.
+     */
+    if (outputMode == OutputMode::CARDBOARD_STEREO && gCardboardReady) {
         glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
     } else {
-        glBindFramebuffer(GL_FRAMEBUFFER, GL_NONE);
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
     }
+
     CHECK_GL_ERROR("Framebuffer");
 
     glDisable(GL_DEPTH_TEST);
-    glEnable(GL_CULL_FACE);
+
+    /*
+     * Камера находится внутри сферы.
+     * CULL_FACE может отбрасывать внутреннюю сторону сферы и давать чёрный экран.
+     */
+    glDisable(GL_CULL_FACE);
+
     glDisable(GL_SCISSOR_TEST);
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
     glClear(GL_COLOR_BUFFER_BIT);
+
     CHECK_GL_ERROR("Params");
 
     time_t now = time(nullptr);
+
     if (vrProgressBarShown) {
         if (now >= vrGuiProgressBarHideAt) {
             LOG_DEBUG("Hiding progress bar");
@@ -368,17 +443,30 @@ void Renderer::DrawFrame(float videoPosition, JNIEnv *env) {
         glActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_EXTERNAL_OES, videoTexture);
         glUseProgram(programVideo);
+
         glViewport((eye - minEye) * eyeWidth, 0, eyeWidth, screenHeight);
 
         auto mvpMatrix = BuildMVPMatrix(eye);
-        glUniformMatrix4fv(programVideoParamMVPMatrix, 1, GL_FALSE, glm::value_ptr(mvpMatrix));
+
+        glUniformMatrix4fv(
+                programVideoParamMVPMatrix,
+                1,
+                GL_FALSE,
+                glm::value_ptr(mvpMatrix)
+        );
 
         auto colorMapMatrix = BuildColorMapMatrix(eye);
-        glUniformMatrix4fv(programVideoParamColorMapMatrix, 1, GL_FALSE,
-                           glm::value_ptr(colorMapMatrix));
+
+        glUniformMatrix4fv(
+                programVideoParamColorMapMatrix,
+                1,
+                GL_FALSE,
+                glm::value_ptr(colorMapMatrix)
+        );
 
         eyeMeshes[eye].Render(programVideoParamPosition, programVideoParamUV);
-        CHECK_GL_ERROR("Render progress bar");
+
+        CHECK_GL_ERROR("Render video");
 
         if (vrProgressBarShown) {
             glUseProgram(program2D);
@@ -389,32 +477,54 @@ void Renderer::DrawFrame(float videoPosition, JNIEnv *env) {
         if (vrGuiShown) {
             glUseProgram(programVRGui);
             glBindTexture(GL_TEXTURE_2D, buttonTexture);
-            glm::mat4 guiMvpMatrix = glm::rotate(mvpMatrix, (float) M_PI - vrGuiCenterTheta,
-                                                 Y_AXIS);
-            glUniformMatrix4fv(programVRGuiParamMVPMatrix, 1, GL_FALSE,
-                               glm::value_ptr(guiMvpMatrix));
+
+            glm::mat4 guiMvpMatrix = glm::rotate(
+                    mvpMatrix,
+                    (float) M_PI - vrGuiCenterTheta,
+                    Y_AXIS
+            );
+
+            glUniformMatrix4fv(
+                    programVRGuiParamMVPMatrix,
+                    1,
+                    GL_FALSE,
+                    glm::value_ptr(guiMvpMatrix)
+            );
+
             for (const VRGuiButton &button: vrGuiButtons) {
                 button.render(programVRGuiParamPosition, programVRGuiParamUV);
             }
 
             glUseProgram(program2D);
             RenderPointer();
+
             CHECK_GL_ERROR("Render GUI");
         }
     }
 
-    if (outputMode == OutputMode::CARDBOARD_STEREO) {
+    /*
+     * Cardboard distortion вызываем только если QR-параметры реально загружены.
+     * Если QR нет, split-screen уже нарисован напрямую.
+     */
+    if (outputMode == OutputMode::CARDBOARD_STEREO && gCardboardReady) {
         CardboardDistortionRenderer_renderEyeToDisplay(
-                cardboardDistortionRenderer.get(), 0,
-                0, 0, screenWidth, screenHeight,
-                &cardboardEyeTextureDescriptions[0], &cardboardEyeTextureDescriptions[1]
+                cardboardDistortionRenderer.get(),
+                0,
+                0,
+                0,
+                screenWidth,
+                screenHeight,
+                &cardboardEyeTextureDescriptions[0],
+                &cardboardEyeTextureDescriptions[1]
         );
+
         CHECK_GL_ERROR("Render cardboard");
 
-        glBindFramebuffer(GL_FRAMEBUFFER, GL_NONE);
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
         glViewport(0, 0, screenWidth, screenHeight);
         glUseProgram(program2D);
         RenderCardboardAlignLine();
+
         CHECK_GL_ERROR("Align line");
     }
 
@@ -422,7 +532,6 @@ void Renderer::DrawFrame(float videoPosition, JNIEnv *env) {
 }
 
 void Renderer::RenderPointer() {
-    // TODO: Pointer size? gl_PointSize?
     glEnableVertexAttribArray(program2DParamPosition);
     glVertexAttribPointer(program2DParamPosition, 3, GL_FLOAT, GL_FALSE, 0, pointerCoords.data());
 
@@ -431,65 +540,146 @@ void Renderer::RenderPointer() {
 
 void Renderer::RenderCardboardAlignLine() {
     glEnableVertexAttribArray(program2DParamPosition);
-    glVertexAttribPointer(program2DParamPosition, 3, GL_FLOAT, GL_FALSE, 0,
-                          cardboardAlignLineCoords.data());
+    glVertexAttribPointer(
+            program2DParamPosition,
+            3,
+            GL_FLOAT,
+            GL_FALSE,
+            0,
+            cardboardAlignLineCoords.data()
+    );
 
     glDrawElements(GL_LINES, 2, GL_UNSIGNED_BYTE, trivial2DData);
 }
 
 bool Renderer::UpdateDeviceParams() {
-    // Checks if screen or device parameters changed
     if (!screenParamsChanged && !deviceParamsChanged) {
         return true;
     }
 
-    // Get saved device parameters
+    gCardboardReady = false;
+
     if (outputMode == OutputMode::CARDBOARD_STEREO) {
-        uint8_t *cardboardQrCode;
-        int size;
+        uint8_t *cardboardQrCode = nullptr;
+        int size = 0;
+
         CardboardQrCode_getSavedDeviceParams(&cardboardQrCode, &size);
 
-        // If there are no parameters saved yet, returns false.
-        if (size == 0) {
-            LOG_ERROR("Cardboard params not available yet");
-            return false;
+        if (size > 0 && cardboardQrCode != nullptr) {
+            LOG_DEBUG("Cardboard params loaded, size=%d", size);
+
+            cardboardLensDistortion = CardboardLensDistortionPointer(
+                    CardboardLensDistortion_create(
+                            cardboardQrCode,
+                            size,
+                            screenWidth,
+                            screenHeight
+                    )
+            );
+
+            CardboardQrCode_destroy(cardboardQrCode);
+
+            gCardboardReady = true;
+        } else {
+            LOG_ERROR("Cardboard params not available. Using simple stereo fallback.");
+
+            /*
+             * Не return false.
+             * Не outputMode = MONO_LEFT.
+             * Оставляем два глаза, но без Cardboard distortion.
+             */
+            gCardboardReady = false;
         }
-
-        cardboardLensDistortion = CardboardLensDistortionPointer(
-                CardboardLensDistortion_create(cardboardQrCode, size, screenWidth, screenHeight)
-        );
-
-        CardboardQrCode_destroy(cardboardQrCode);
     }
 
     GlSetup();
 
-    if (outputMode == OutputMode::CARDBOARD_STEREO) {
+    if (outputMode == OutputMode::CARDBOARD_STEREO && gCardboardReady) {
         const CardboardOpenGlEsDistortionRendererConfig config{kGlTexture2D};
+
         cardboardDistortionRenderer = CardboardDistortionRendererPointer(
                 CardboardOpenGlEs2DistortionRenderer_create(&config)
         );
 
         CardboardMesh leftMesh;
         CardboardMesh rightMesh;
-        CardboardLensDistortion_getDistortionMesh(cardboardLensDistortion.get(), kLeft, &leftMesh);
-        CardboardLensDistortion_getDistortionMesh(cardboardLensDistortion.get(), kRight,
-                                                  &rightMesh);
 
-        CardboardDistortionRenderer_setMesh(cardboardDistortionRenderer.get(), &leftMesh, kLeft);
-        CardboardDistortionRenderer_setMesh(cardboardDistortionRenderer.get(), &rightMesh, kRight);
+        CardboardLensDistortion_getDistortionMesh(
+                cardboardLensDistortion.get(),
+                kLeft,
+                &leftMesh
+        );
 
-        // Get eye matrices
-        CardboardLensDistortion_getEyeFromHeadMatrix(cardboardLensDistortion.get(), kLeft,
-                                                     glm::value_ptr(cardboardEyeMatrices[0]));
-        CardboardLensDistortion_getEyeFromHeadMatrix(cardboardLensDistortion.get(), kRight,
-                                                     glm::value_ptr(cardboardEyeMatrices[1]));
-        CardboardLensDistortion_getProjectionMatrix(cardboardLensDistortion.get(), kRight, kzNear,
-                                                    kzFar,
-                                                    glm::value_ptr(cardboardProjectionMatrices[0]));
-        CardboardLensDistortion_getProjectionMatrix(cardboardLensDistortion.get(), kRight, kzNear,
-                                                    kzFar,
-                                                    glm::value_ptr(cardboardProjectionMatrices[1]));
+        CardboardLensDistortion_getDistortionMesh(
+                cardboardLensDistortion.get(),
+                kRight,
+                &rightMesh
+        );
+
+        CardboardDistortionRenderer_setMesh(
+                cardboardDistortionRenderer.get(),
+                &leftMesh,
+                kLeft
+        );
+
+        CardboardDistortionRenderer_setMesh(
+                cardboardDistortionRenderer.get(),
+                &rightMesh,
+                kRight
+        );
+
+        CardboardLensDistortion_getEyeFromHeadMatrix(
+                cardboardLensDistortion.get(),
+                kLeft,
+                glm::value_ptr(cardboardEyeMatrices[0])
+        );
+
+        CardboardLensDistortion_getEyeFromHeadMatrix(
+                cardboardLensDistortion.get(),
+                kRight,
+                glm::value_ptr(cardboardEyeMatrices[1])
+        );
+
+        CardboardLensDistortion_getProjectionMatrix(
+                cardboardLensDistortion.get(),
+                kLeft,
+                kzNear,
+                kzFar,
+                glm::value_ptr(cardboardProjectionMatrices[0])
+        );
+
+        CardboardLensDistortion_getProjectionMatrix(
+                cardboardLensDistortion.get(),
+                kRight,
+                kzNear,
+                kzFar,
+                glm::value_ptr(cardboardProjectionMatrices[1])
+        );
+    }
+
+    if (outputMode == OutputMode::CARDBOARD_STEREO && !gCardboardReady) {
+        /*
+         * Fallback без Cardboard QR:
+         * два глаза, две половины экрана, без distortion.
+         */
+        cardboardEyeMatrices[0] = glm::mat4(1.0f);
+        cardboardEyeMatrices[1] = glm::mat4(1.0f);
+
+        const float fallbackAspect = screenAspect * 0.5f;
+
+        cardboardProjectionMatrices[0] = glm::perspective(
+                glm::radians(useLookAtControl ? controlFov : 90.0f),
+                fallbackAspect,
+                kzNear,
+                kzFar
+        );
+
+        cardboardProjectionMatrices[1] = glm::perspective(
+                glm::radians(useLookAtControl ? controlFov : 90.0f),
+                fallbackAspect,
+                kzNear,
+                kzFar
+        );
     }
 
     screenParamsChanged = false;
@@ -506,23 +696,33 @@ void Renderer::GlSetup() {
     if (glInitialized) {
         GlTeardown();
     }
+
     glInitialized = true;
 
-    // Create render texture.
     glGenTextures(1, &renderTexture);
     glBindTexture(GL_TEXTURE_2D, renderTexture);
+
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, screenWidth, screenHeight, 0, GL_RGB, GL_UNSIGNED_BYTE,
-                 nullptr);
+    glTexImage2D(
+            GL_TEXTURE_2D,
+            0,
+            GL_RGB,
+            screenWidth,
+            screenHeight,
+            0,
+            GL_RGB,
+            GL_UNSIGNED_BYTE,
+            nullptr
+    );
 
-    // Create render target.
     glGenFramebuffers(1, &framebuffer);
     glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, renderTexture, 0);
+
     CHECK_GL_ERROR("Create render buffer");
 
     cardboardEyeTextureDescriptions[0] = {
@@ -532,6 +732,7 @@ void Renderer::GlSetup() {
             .top_v = 1.0f,
             .bottom_v = 0.0f
     };
+
     cardboardEyeTextureDescriptions[1] = {
             .texture = renderTexture,
             .left_u = 0.5f,
@@ -547,14 +748,86 @@ void Renderer::GlTeardown() {
     if (!glInitialized) {
         return;
     }
+
     glInitialized = false;
 
     glDeleteFramebuffers(1, &framebuffer);
     framebuffer = 0;
+
     glDeleteTextures(1, &renderTexture);
     renderTexture = 0;
 
     CHECK_GL_ERROR("GlTeardown");
+}
+
+float Renderer::NormalizeAngle(float value) {
+    while (value > glm::pi<float>()) {
+        value -= glm::two_pi<float>();
+    }
+
+    while (value < -glm::pi<float>()) {
+        value += glm::two_pi<float>();
+    }
+
+    return value;
+}
+
+float Renderer::ShortestAngleDelta(float from, float to) {
+    return NormalizeAngle(to - from);
+}
+
+float Renderer::SmoothStep(float t) {
+    t = glm::clamp(t, 0.0f, 1.0f);
+    return t * t * (3.0f - 2.0f * t);
+}
+
+void Renderer::UpdateLookAtAnimation() {
+    if (!useLookAtControl || !lookAtAnimating) {
+        return;
+    }
+
+    const uint64_t nowMs = GetBootTimeNano() / 1000000ULL;
+    const uint64_t elapsedMs = nowMs > lookAtStartMs ? nowMs - lookAtStartMs : 0;
+
+    float t = static_cast<float>(elapsedMs) / static_cast<float>(lookAtDurationMs);
+    t = SmoothStep(t);
+
+    const float yawDelta = ShortestAngleDelta(startYaw, targetYaw);
+
+    controlYaw = NormalizeAngle(startYaw + yawDelta * t);
+    controlPitch = startPitch + (targetPitch - startPitch) * t;
+    controlFov = startFov + (targetFov - startFov) * t;
+
+    if (elapsedMs >= lookAtDurationMs) {
+        controlYaw = NormalizeAngle(targetYaw);
+        controlPitch = targetPitch;
+        controlFov = targetFov;
+        lookAtAnimating = false;
+    }
+}
+
+glm::mat4 Renderer::BuildControlledViewMatrix() const {
+    /*
+     * Если серверный yaw будет зеркалить,
+     * поменяй -controlYaw на controlYaw.
+     */
+    glm::mat4 yawMatrix = glm::rotate(
+            glm::mat4(1.0f),
+            -controlYaw,
+            glm::vec3(0.0f, 1.0f, 0.0f)
+    );
+
+    /*
+     * Если серверный pitch будет зеркалить,
+     * поменяй -controlPitch на controlPitch.
+     */
+    glm::mat4 pitchMatrix = glm::rotate(
+            glm::mat4(1.0f),
+            -controlPitch,
+            glm::vec3(1.0f, 0.0f, 0.0f)
+    );
+
+    return pitchMatrix * yawMatrix;
 }
 
 glm::mat4 Renderer::BuildMVPMatrix(int eye) {
@@ -576,14 +849,34 @@ glm::mat4 Renderer::BuildMVPMatrix(int eye) {
     switch (outputMode) {
         case OutputMode::MONO_LEFT:
         case OutputMode::MONO_RIGHT:
-            projection = glm::perspective(glm::radians(90.0f) / screenAspect, screenAspect, kzNear,
-                                          kzFar);
-            view = viewMatrix;
+            projection = glm::perspective(
+                    glm::radians(useLookAtControl ? controlFov : 90.0f) / screenAspect,
+                    screenAspect,
+                    kzNear,
+                    kzFar
+            );
+
+            if (useLookAtControl) {
+                /*
+                 * Сервер задаёт базовое направление,
+                 * живая голова работает поверх него.
+                 */
+                view = BuildControlledViewMatrix() * viewMatrix;
+            } else {
+                view = viewMatrix;
+            }
+
             break;
 
         case OutputMode::CARDBOARD_STEREO:
-            view = cardboardEyeMatrices[eye] * viewMatrix;
             projection = cardboardProjectionMatrices[eye];
+
+            if (useLookAtControl) {
+                view = cardboardEyeMatrices[eye] * BuildControlledViewMatrix() * viewMatrix;
+            } else {
+                view = cardboardEyeMatrices[eye] * viewMatrix;
+            }
+
             break;
 
         default:
@@ -599,9 +892,9 @@ glm::mat4 Renderer::BuildColorMapMatrix(int eye) {
     }
 
     assert(eye >= 0 && eye <= 1);
+
     switch (eye) {
         case 0:
-            // red
             return {
                     1.0f, 1.0f, 1.0f, 0.0f,
                     0.0f, 0.0f, 0.0f, 0.0f,
@@ -610,7 +903,6 @@ glm::mat4 Renderer::BuildColorMapMatrix(int eye) {
             };
 
         case 1:
-            // cyan
             return {
                     0.0f, 0.0f, 0.0f, 0.0f,
                     0.0f, 1.0f, 0.0f, 0.0f,
@@ -623,15 +915,22 @@ glm::mat4 Renderer::BuildColorMapMatrix(int eye) {
     }
 }
 
-void Renderer::SetOptions(InputVideoLayout requestedInputLayout, InputVideoMode requestedInputMode,
+void Renderer::SetOptions(InputVideoLayout requestedInputLayout,
+                          InputVideoMode requestedInputMode,
                           OutputMode requestedOutputMode) {
-    LOG_DEBUG("SetOptions(%d, %d, %d)", requestedInputLayout, requestedInputMode,
-              requestedOutputMode);
+    LOG_DEBUG(
+            "SetOptions(%d, %d, %d)",
+            requestedInputLayout,
+            requestedInputMode,
+            requestedOutputMode
+    );
+
     deviceParamsChanged |= requestedOutputMode != this->outputMode;
 
     this->inputVideoLayout = requestedInputLayout;
     this->inputVideoMode = requestedInputMode;
     this->outputMode = requestedOutputMode;
+
     ComputeMesh();
 }
 
@@ -646,16 +945,20 @@ void Renderer::ShowProgressBar() {
     vrGuiProgressBarHideAt = time(nullptr) + PROGRESS_BAR_SHOW_TIME;
 }
 
-static TexturedMesh
-BuildUvSphereMesh(int n_slices, int n_stacks, float minTheta, float maxTheta, float uvLeft,
-                  float uvTop, float uvRight, float uvBottom) {
+static TexturedMesh BuildUvSphereMesh(int n_slices,
+                                      int n_stacks,
+                                      float minTheta,
+                                      float maxTheta,
+                                      float uvLeft,
+                                      float uvTop,
+                                      float uvRight,
+                                      float uvBottom) {
     TexturedMesh::Builder meshBuilder;
 
     float uvWidth = uvRight - uvLeft;
     float uvHeight = uvBottom - uvTop;
     float thetaRange = maxTheta - minTheta;
 
-    // generate vertices per stack / slice
     for (int i = 0; i <= n_stacks; i++) {
         auto vFrac = float(i) / float(n_stacks);
         auto phi = float(M_PI) * vFrac;
@@ -665,36 +968,37 @@ BuildUvSphereMesh(int n_slices, int n_stacks, float minTheta, float maxTheta, fl
             auto uFrac = float(j) / float(n_slices);
             auto theta = -(minTheta + thetaRange * uFrac);
             auto u = uFrac * uvWidth + uvLeft;
+
             auto x = std::sinf(phi) * std::sinf(theta);
             auto y = std::cosf(phi);
             auto z = std::sinf(phi) * std::cosf(theta);
 
-            // texture correction for top- and bottom-layer vertices (collapsed into a point)
             if ((i == 0) || (i == n_stacks)) {
                 u += 1.0f / float(n_slices);
-                if (u > 1.0f) u -= 1.0f;
+                if (u > 1.0f) {
+                    u -= 1.0f;
+                }
             }
 
             meshBuilder.add_vertex(x, y, z, u, v);
         }
     }
 
-    // add quads per stack / slice
     for (int j = 0; j < n_stacks; j++) {
         auto j0 = j * (n_slices + 1);
         auto j1 = (j + 1) * (n_slices + 1);
+
         for (int i = 0; i < n_slices; i++) {
             auto i0 = j0 + i;
             auto i1 = j0 + (i + 1);
             auto i2 = j1 + (i + 1);
             auto i3 = j1 + i;
-            // top- or bottom-layer are just triangles
+
             if (j == 0) {
                 meshBuilder.add_triangle(i0, i2, i3);
             } else if (j == (n_stacks - 1)) {
                 meshBuilder.add_triangle(i0, i2, i1);
             } else {
-                // otherwise, quads
                 meshBuilder.add_quad(i0, i1, i2, i3);
             }
         }
@@ -703,9 +1007,13 @@ BuildUvSphereMesh(int n_slices, int n_stacks, float minTheta, float maxTheta, fl
     return meshBuilder.build();
 }
 
-static TexturedMesh
-BuildCylindricalMesh(int n_slices, float minTheta, float maxTheta, float uvLeft, float uvTop,
-                     float uvRight, float uvBottom) {
+static TexturedMesh BuildCylindricalMesh(int n_slices,
+                                         float minTheta,
+                                         float maxTheta,
+                                         float uvLeft,
+                                         float uvTop,
+                                         float uvRight,
+                                         float uvBottom) {
     TexturedMesh::Builder meshBuilder;
 
     float uvWidth = uvRight - uvLeft;
@@ -715,11 +1023,13 @@ BuildCylindricalMesh(int n_slices, float minTheta, float maxTheta, float uvLeft,
         auto uFrac = float(i) / float(n_slices);
         auto theta = -(minTheta + thetaRange * uFrac);
         auto u = uFrac * uvWidth + uvLeft;
+
         auto x = std::sinf(theta);
         auto z = std::cosf(theta);
 
         auto i1 = meshBuilder.add_vertex(x, 1, z, u, uvTop);
         auto i2 = meshBuilder.add_vertex(x, -1, z, u, uvBottom);
+
         if (i > 0) {
             meshBuilder.add_quad(i1 - 2, i1, i2, i2 - 2);
         }
@@ -731,6 +1041,7 @@ BuildCylindricalMesh(int n_slices, float minTheta, float maxTheta, float uvLeft,
 void Renderer::ComputeMesh() {
     for (int eye = 0; eye < 2; ++eye) {
         float uvLeft, uvTop, uvRight, uvBottom;
+
         switch (inputVideoLayout) {
             case InputVideoLayout::MONO:
             case InputVideoLayout::ANAGLYPH_RED_CYAN:
@@ -760,7 +1071,6 @@ void Renderer::ComputeMesh() {
 
         switch (inputVideoMode) {
             case InputVideoMode::PLAIN_FOV: {
-                // plain rectangle
                 const float xScale = videoAspect > 1.0f ? 1.0f : (1.0f / videoAspect);
                 const float yScale = videoAspect > 1.0f ? (1.0f / videoAspect) : 1.0f;
 
@@ -770,12 +1080,14 @@ void Renderer::ComputeMesh() {
                         +xScale, -yScale, PLAIN_FOV_Z,
                         -xScale, -yScale, PLAIN_FOV_Z
                 }};
+
                 std::unique_ptr<GLfloat[]> uv{new GLfloat[8]{
                         uvLeft, uvTop,
                         uvRight, uvTop,
                         uvRight, uvBottom,
                         uvLeft, uvBottom
                 }};
+
                 std::unique_ptr<GLushort[]> indices{new GLushort[6]{
                         0, 2, 1,
                         0, 3, 2
@@ -794,26 +1106,56 @@ void Renderer::ComputeMesh() {
             }
 
             case InputVideoMode::EQUIRECT_180:
-                eyeMeshes[eye] = BuildUvSphereMesh(20, 20, M_PI_2, M_PI * 1.5f, uvLeft, uvTop,
-                                                   uvRight, uvBottom);
+                eyeMeshes[eye] = BuildUvSphereMesh(
+                        20,
+                        20,
+                        M_PI_2,
+                        M_PI * 1.5f,
+                        uvLeft,
+                        uvTop,
+                        uvRight,
+                        uvBottom
+                );
                 break;
 
             case InputVideoMode::EQUIRECT_360:
-                eyeMeshes[eye] = BuildUvSphereMesh(40, 20, 0, M_PI * 2.0f, uvLeft, uvTop,
-                                                   uvRight, uvBottom);
+                eyeMeshes[eye] = BuildUvSphereMesh(
+                        40,
+                        20,
+                        0,
+                        M_PI * 2.0f,
+                        uvLeft,
+                        uvTop,
+                        uvRight,
+                        uvBottom
+                );
                 break;
 
             case InputVideoMode::PANORAMA_180:
-                eyeMeshes[eye] = BuildCylindricalMesh(20, M_PI_2, M_PI * 1.5f, uvLeft, uvTop,
-                                                      uvRight, uvBottom);
+                eyeMeshes[eye] = BuildCylindricalMesh(
+                        20,
+                        M_PI_2,
+                        M_PI * 1.5f,
+                        uvLeft,
+                        uvTop,
+                        uvRight,
+                        uvBottom
+                );
                 break;
 
             case InputVideoMode::PANORAMA_360:
-                eyeMeshes[eye] = BuildCylindricalMesh(40, 0, M_PI * 2.0f, uvLeft, uvTop, uvRight,
-                                                      uvBottom);
+                eyeMeshes[eye] = BuildCylindricalMesh(
+                        40,
+                        0,
+                        M_PI * 2.0f,
+                        uvLeft,
+                        uvTop,
+                        uvRight,
+                        uvBottom
+                );
                 break;
 
-            default:
+            default: {
                 std::unique_ptr<GLfloat[]> pos{new GLfloat[]{
                         -1.0, -1.0, -1.0,
                         +1.0, -1.0, -1.0,
@@ -824,6 +1166,7 @@ void Renderer::ComputeMesh() {
                         +1.0, +1.0, +1.0,
                         -1.0, +1.0, +1.0
                 }};
+
                 std::unique_ptr<GLfloat[]> uv{new GLfloat[]{
                         0.0f, 0.0f,
                         1.0f, 0.0f,
@@ -834,6 +1177,7 @@ void Renderer::ComputeMesh() {
                         1.0f, 1.0f,
                         0.0f, 1.0f,
                 }};
+
                 std::unique_ptr<GLushort[]> indices{new GLushort[]{
                         0, 5, 4, 0, 1, 5,
                         1, 6, 5, 1, 2, 6,
@@ -852,13 +1196,123 @@ void Renderer::ComputeMesh() {
                                 std::move(indices)
                         );
                 break;
+            }
         }
     }
 }
 
 void Renderer::UpdatePose(JNIEnv *env) {
+    /*
+     * ВАЖНО:
+     * Для настоящего режима очков CardboardStereo + Cardboard QR
+     * используем именно CardboardHeadTracker.
+     *
+     * Android SensorManager оставляем только как fallback,
+     * когда Cardboard QR нет или режим не настоящий Cardboard.
+     */
+
+    const bool useCardboardTracker =
+            outputMode == OutputMode::CARDBOARD_STEREO && gCardboardReady;
+
+    if (useCardboardTracker) {
+        glm::quat headOrientationQuat;
+        glm::vec3 headPosition;
+
+        CardboardHeadTracker_getPose(
+                cardboardHeadTracker.get(),
+                static_cast<int64_t>(GetBootTimeNano() + kPredictionTimeWithoutVsyncNanos),
+                kLandscapeLeft,
+                glm::value_ptr(headPosition),
+                glm::value_ptr(headOrientationQuat)
+        );
+
+        viewMatrix = glm::toMat4(headOrientationQuat);
+
+        const glm::vec4 pointVector = NEG_Z_AXIS * viewMatrix;
+
+        pitch = asinf(pointVector.y);
+
+        if (pitch > 1.55f) {
+            /*
+             * Слишком вертикально — оставляем предыдущий yaw.
+             */
+        } else {
+            yaw = -atan2f(pointVector.x, pointVector.z);
+        }
+
+        if (isHeadGesturingUp) {
+            if (pitch < HEAD_GESTURE_PITCH_LIMIT_RETURN) {
+                isHeadGesturingUp = false;
+                LOG_DEBUG("UpdatePose: Moved from up to not-up");
+            }
+        } else {
+            if (pitch > HEAD_GESTURE_PITCH_LIMIT) {
+                isHeadGesturingUp = true;
+                vrGuiShown = !vrGuiShown;
+                vrGuiCenterTheta = yaw;
+                LOG_DEBUG("UpdatePose: Moved from not-up to up");
+            }
+        }
+
+        if (vrGuiShown) {
+            for (VRGuiButton &button: vrGuiButtons) {
+                ButtonAction hitAction = button.evaluatePossibleHit(
+                        M_PI + yaw - vrGuiCenterTheta,
+                        pitch
+                );
+
+                if (hitAction != ButtonAction::NONE) {
+                    this->ExecuteButtonAction(hitAction, env);
+                }
+            }
+        }
+
+        return;
+    }
+
+    /*
+     * Fallback:
+     * Если Cardboard QR нет, используем Android SensorManager.
+     * Этот режим нужен, чтобы не было чёрного экрана,
+     * но для настоящих очков он хуже CardboardHeadTracker.
+     */
+    if (useManualRotation) {
+        glm::mat4 yawMatrix = glm::rotate(
+                glm::mat4(1.0f),
+                manualYaw,
+                glm::vec3(0.0f, 1.0f, 0.0f)
+        );
+
+        glm::mat4 pitchMatrix = glm::rotate(
+                glm::mat4(1.0f),
+                -manualPitch,
+                glm::vec3(1.0f, 0.0f, 0.0f)
+        );
+
+        /*
+         * Roll лучше отключить, чтобы картинка не заваливалась в очках.
+         */
+        glm::mat4 rollMatrix = glm::mat4(1.0f);
+
+        viewMatrix = rollMatrix * pitchMatrix * yawMatrix;
+
+        const glm::vec4 pointVector = NEG_Z_AXIS * viewMatrix;
+
+        pitch = asinf(pointVector.y);
+
+        if (pitch <= 1.55f) {
+            yaw = -atan2f(pointVector.x, pointVector.z);
+        }
+
+        return;
+    }
+
+    /*
+     * Последний fallback — обычный Cardboard tracker даже без QR.
+     */
     glm::quat headOrientationQuat;
     glm::vec3 headPosition;
+
     CardboardHeadTracker_getPose(
             cardboardHeadTracker.get(),
             static_cast<int64_t>(GetBootTimeNano() + kPredictionTimeWithoutVsyncNanos),
@@ -867,41 +1321,14 @@ void Renderer::UpdatePose(JNIEnv *env) {
             glm::value_ptr(headOrientationQuat)
     );
 
-    // viewMatrix = glm::translate(toMat4(headOrientationQuat), headPosition);
     viewMatrix = glm::toMat4(headOrientationQuat);
 
     const glm::vec4 pointVector = NEG_Z_AXIS * viewMatrix;
+
     pitch = asinf(pointVector.y);
-    if (pitch > 1.55f) { // roughly 88.8°
-        // too vertical: just keep the previous yaw
-    } else {
+
+    if (pitch <= 1.55f) {
         yaw = -atan2f(pointVector.x, pointVector.z);
-    }
-
-    if (isHeadGesturingUp) {
-        if (pitch < HEAD_GESTURE_PITCH_LIMIT_RETURN) {
-            // head moved from up to not-up
-            isHeadGesturingUp = false;
-            LOG_DEBUG("UpdatePose: Moved from up to not-up");
-        }
-    } else {
-        if (pitch > HEAD_GESTURE_PITCH_LIMIT) {
-            // head moved from not-up to up
-            isHeadGesturingUp = true;
-            vrGuiShown = !vrGuiShown;
-            vrGuiCenterTheta = yaw;
-            LOG_DEBUG("UpdatePose: Moved from not-up to up");
-        }
-    }
-
-    if (vrGuiShown) {
-        for (VRGuiButton &button: vrGuiButtons) {
-            ButtonAction hitAction = button.evaluatePossibleHit(M_PI + yaw - vrGuiCenterTheta,
-                                                                pitch);
-            if (hitAction != ButtonAction::NONE) {
-                this->ExecuteButtonAction(hitAction, env);
-            }
-        }
     }
 }
 
@@ -915,11 +1342,9 @@ void Renderer::OnVideoSizeChanged(int width, int height) {
 void Renderer::ExecuteButtonAction(const ButtonAction action, JNIEnv *env) {
     switch (action) {
         case ButtonAction::NONE:
-            // wat
             break;
 
         case ButtonAction::RECENTER_YAW:
-            // TODO: Delay recenter?
             CardboardHeadTracker_recenter(cardboardHeadTracker.get());
             break;
 
@@ -931,4 +1356,3 @@ void Renderer::ExecuteButtonAction(const ButtonAction action, JNIEnv *env) {
             break;
     }
 }
-

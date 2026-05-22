@@ -51,6 +51,19 @@ class MainActivity : AppCompatActivity(),
     private lateinit var controller: Controller
 
     private var nativeApp: Long = 0L
+    private var teacherControlClient: TeacherControlClient? = null
+
+    /*
+     * IP компьютера/сервера.
+     * Не ставить 127.0.0.1 — на телефоне это сам телефон.
+     */
+    private val serverIp = "192.168.1.104"
+
+    /*
+     * По твоему index.html VR WebSocket работает на 8071:
+     * ws://host:8071/vr-view-ws
+     */
+    private val vrWsPort = 8071
 
     /*
      * Для твоего 360-видео:
@@ -60,7 +73,12 @@ class MainActivity : AppCompatActivity(),
      */
     private var inputLayout: InputLayout = InputLayout.Mono
     private var inputMode: InputMode = InputMode.Equirect360
-    private var outputMode: OutputMode = OutputMode.CardboardStereo
+
+    /*
+ * Сначала MonoLeft, чтобы исключить проблему Cardboard QR.
+ * Когда видео заработает — можно вернуть OutputMode.CardboardStereo.
+ */
+    private var outputMode: OutputMode = OutputMode.CardboardStereo ///для теста
 
     private var multicastLock: WifiManager.MulticastLock? = null
     private var lastTouchCoordinates = arrayOf(1.0f, 0.0f)
@@ -83,14 +101,52 @@ class MainActivity : AppCompatActivity(),
 
         requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
 
+        fun radiusToFov(radius: Float): Float {
+            val r = radius.coerceIn(0f, 300f)
+
+            return if (r <= 150f) {
+                val t = r / 150f
+                120f + (90f - 120f) * t
+            } else {
+                val t = (r - 150f) / 150f
+                90f + (35f - 90f) * t
+            }
+        }
+
+        fun lookAtFromServer(
+            yaw: Float,
+            pitch: Float,
+            radius: Float,
+            duration: Int
+        ) {
+            if (nativeApp == 0L) {
+                Log.w(TAG, "lookAtFromServer ignored: nativeApp=0")
+                return
+            }
+
+            val fov = radiusToFov(radius)
+
+            Log.d(
+                TAG,
+                "lookAtFromServer yaw=$yaw pitch=$pitch radius=$radius fov=$fov duration=$duration"
+            )
+
+            NativeLibrary.nativeLookAtPoint(
+                nativeApp,
+                yaw,
+                pitch,
+                fov,
+                duration
+            )
+        }
+
         acquireMulticastLock()
 
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
 
         /*
-         * Инициализация Android-датчика поворота.
-         * Сначала пробуем GAME_ROTATION_VECTOR, потом обычный ROTATION_VECTOR.
+         * Датчик поворота Android.
          */
         sensorManager = getSystemService(Context.SENSOR_SERVICE) as SensorManager
 
@@ -100,33 +156,12 @@ class MainActivity : AppCompatActivity(),
 
         Log.d(TAG, "rotationSensor=${rotationSensor?.name}")
 
-        glView = binding.surfaceView
-        glView.setEGLContextClientVersion(2)
-
-        val renderer = Renderer()
-        glView.setRenderer(renderer)
-        glView.renderMode = GLSurfaceView.RENDERMODE_CONTINUOUSLY
-
-        glView.setOnTouchListener { _, event ->
-            if (event.actionMasked == MotionEvent.ACTION_DOWN) {
-                lastTouchCoordinates[0] = event.x
-                lastTouchCoordinates[1] = event.y
-            }
-            false
-        }
-
-        glView.setOnClickListener {
-            val x = lastTouchCoordinates[0]
-            val halfWidth = glView.width.coerceAtLeast(1) * 0.5f
-            val relX = (x - halfWidth) / halfWidth
-
-            videoTexturePlayer.seek((10000 * relX).roundToInt())
-
-            if (nativeApp != 0L) {
-                NativeLibrary.nativeShowProgressBar(nativeApp)
-            }
-        }
-
+        /*
+         * ВАЖНО:
+         * Сначала создаём VideoTexturePlayer, Controller и nativeApp.
+         * Только потом вызываем glView.setRenderer().
+         * Иначе GLSurfaceView может вызвать onSurfaceCreated раньше nativeInit.
+         */
         videoTexturePlayer = VideoTexturePlayer(
             context = this,
             videoSizeChangedListener = this
@@ -152,9 +187,57 @@ class MainActivity : AppCompatActivity(),
         )
 
         /*
-         * Принудительно запускаем Cardboard/native часть.
+         * GLSurfaceView / OpenGL.
+         * У тебя shaders в Renderer.cpp используют #version 300 es,
+         * значит нужен OpenGL ES 3, а не 2.
+         */
+        glView = binding.surfaceView
+        glView.setEGLContextClientVersion(3)
+
+        val renderer = Renderer()
+        glView.setRenderer(renderer)
+        glView.renderMode = GLSurfaceView.RENDERMODE_CONTINUOUSLY
+
+        glView.setOnTouchListener { _, event ->
+            if (event.actionMasked == MotionEvent.ACTION_DOWN) {
+                lastTouchCoordinates[0] = event.x
+                lastTouchCoordinates[1] = event.y
+            }
+            false
+        }
+
+        /*
+         * Тестовый клик:
+         * При нажатии на экран камера должна повернуться вправо.
+         * После проверки можно убрать или заменить обратно.
+
+        glView.setOnClickListener {
+            lookAtFromServer(
+                yaw = 90f,
+                pitch = 0f,
+                radius = 150f,
+                duration = 1000
+            )
+        }
+        *
+        */
+
+        /*
+         * Запуск native/Cardboard части.
          */
         NativeLibrary.nativeOnResume(nativeApp)
+
+        /*
+         * WebSocket управления точкой.
+         * ВАЖНО: порт 8071, не 8070.
+         */
+        teacherControlClient = TeacherControlClient(
+            wsUrl = "ws://$serverIp:$vrWsPort/vr-view-ws"
+        ) { yaw, pitch, radius, duration ->
+            lookAtFromServer(yaw, pitch, radius, duration)
+        }
+
+        teacherControlClient?.start()
 
         enterImmersiveMode()
 
@@ -261,6 +344,45 @@ class MainActivity : AppCompatActivity(),
         popup.show()
     }
 
+    private fun radiusToFov(radius: Float): Float {
+        val r = radius.coerceIn(0f, 300f)
+
+        return if (r <= 150f) {
+            val t = r / 150f
+            120f + (90f - 120f) * t
+        } else {
+            val t = (r - 150f) / 150f
+            90f + (35f - 90f) * t
+        }
+    }
+
+    private fun lookAtFromServer(
+        yaw: Float,
+        pitch: Float,
+        radius: Float,
+        duration: Int
+    ) {
+        if (nativeApp == 0L) {
+            Log.w(TAG, "lookAtFromServer ignored: nativeApp=0")
+            return
+        }
+
+        val fov = radiusToFov(radius)
+
+        Log.d(
+            TAG,
+            "lookAtFromServer yaw=$yaw pitch=$pitch radius=$radius fov=$fov duration=$duration"
+        )
+
+        NativeLibrary.nativeLookAtPoint(
+            nativeApp,
+            yaw,
+            pitch,
+            fov,
+            duration
+        )
+    }
+
     private fun setInputLayout(newLayout: InputLayout, menuItem: MenuItem) {
         if (newLayout == inputLayout) return
 
@@ -351,13 +473,21 @@ class MainActivity : AppCompatActivity(),
     }
 
     override fun onDestroy() {
-        super.onDestroy()
-
         Log.d(TAG, "onDestroy()")
 
-        sensorManager.unregisterListener(this)
+        teacherControlClient?.stop()
+        teacherControlClient = null
 
-        videoTexturePlayer.onDestroy()
+        try {
+            sensorManager.unregisterListener(this)
+        } catch (_: Throwable) {
+        }
+
+        try {
+            videoTexturePlayer.onDestroy()
+        } catch (e: Throwable) {
+            Log.e(TAG, "videoTexturePlayer.onDestroy error", e)
+        }
 
         if (nativeApp != 0L) {
             NativeLibrary.nativeOnDestroy(nativeApp)
@@ -365,6 +495,8 @@ class MainActivity : AppCompatActivity(),
         }
 
         releaseMulticastLock()
+
+        super.onDestroy()
     }
 
     override fun onVideoSizeChanged(mp: MediaPlayer?, width: Int, height: Int) {

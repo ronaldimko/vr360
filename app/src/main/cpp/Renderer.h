@@ -78,6 +78,8 @@ public:
 
     void SetManualRotation(float yaw, float pitch, float roll);
 
+    void LookAtPoint(float yawDeg, float pitchDeg, float fovDeg, int durationMs);
+
     void OnVideoSizeChanged(int width, int height);
 
 
@@ -133,6 +135,27 @@ private:
     float yaw;
     float pitch;
 
+/*
+ * Управление камерой по команде сервера:
+ * yaw/pitch/fov/duration.
+ */
+    bool useLookAtControl = false;
+
+    float controlYaw = 0.0f;
+    float controlPitch = 0.0f;
+    float controlFov = 90.0f;
+
+    float startYaw = 0.0f;
+    float startPitch = 0.0f;
+    float startFov = 90.0f;
+
+    float targetYaw = 0.0f;
+    float targetPitch = 0.0f;
+    float targetFov = 90.0f;
+
+    bool lookAtAnimating = false;
+    uint64_t lookAtStartMs = 0;
+    uint64_t lookAtDurationMs = 0;
 
     /*
  * Ручной поворот от Android SensorManager.
@@ -167,6 +190,16 @@ private:
     void InitVideoTexture(JNIEnv *env, GLuint &textureId);
 
     void InitStaticTexture(JNIEnv *env, GLuint &textureId, const std::string &path);
+
+    void UpdateLookAtAnimation();
+
+    glm::mat4 BuildControlledViewMatrix() const;
+
+    static float NormalizeAngle(float value);
+
+    static float ShortestAngleDelta(float from, float to);
+
+    static float SmoothStep(float t);
 
     glm::mat4 BuildMVPMatrix(int eye);
 

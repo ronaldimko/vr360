@@ -39,6 +39,14 @@ object NativeLibrary {
         roll: Float
     )
 
+    external fun nativeLookAtPoint(
+        nativeApp: Long,
+        yawDeg: Float,
+        pitchDeg: Float,
+        fovDeg: Float,
+        durationMs: Int
+    )
+
     init {
         System.loadLibrary("vrvideoplayer")
     }

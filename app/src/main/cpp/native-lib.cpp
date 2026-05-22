@@ -47,6 +47,28 @@ Java_cz_mormegil_vrvideoplayer_NativeLibrary_nativeSetManualRotation(
 }
 
 extern "C" JNIEXPORT void JNICALL
+Java_cz_mormegil_vrvideoplayer_NativeLibrary_nativeLookAtPoint(
+        JNIEnv * /* jenv */,
+        jobject /* this */,
+        jlong native_app,
+        jfloat yawDeg,
+        jfloat pitchDeg,
+        jfloat fovDeg,
+        jint durationMs) {
+    if (native_app == 0) {
+        LOG_ERROR("nativeLookAtPoint: native_app is null");
+        return;
+    }
+
+    fromJava(native_app)->LookAtPoint(
+            yawDeg,
+            pitchDeg,
+            fovDeg,
+            durationMs
+    );
+}
+
+extern "C" JNIEXPORT void JNICALL
 Java_cz_mormegil_vrvideoplayer_NativeLibrary_nativeOnResume(
         JNIEnv * /* env */,
         jobject /* this */,
@@ -101,7 +123,7 @@ Java_cz_mormegil_vrvideoplayer_NativeLibrary_nativeSetOptions(
         jint input_layout_int,
         jint input_mode_int,
         jint output_mode_int) {
-    LOG_DEBUG("nativeScanCardboardQr");
+    LOG_DEBUG("nativeSetOptions");
     fromJava(native_app)->SetOptions(
             static_cast<InputVideoLayout>(input_layout_int),
             static_cast<InputVideoMode>(input_mode_int),
