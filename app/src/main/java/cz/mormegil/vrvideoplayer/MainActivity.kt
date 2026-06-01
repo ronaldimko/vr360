@@ -27,7 +27,6 @@ import androidx.core.view.WindowInsetsControllerCompat
 import cz.mormegil.vrvideoplayer.databinding.ActivityMainBinding
 import javax.microedition.khronos.egl.EGLConfig
 import javax.microedition.khronos.opengles.GL10
-import kotlin.math.roundToInt
 
 class MainActivity : AppCompatActivity(),
     MediaPlayer.OnVideoSizeChangedListener,
@@ -37,8 +36,9 @@ class MainActivity : AppCompatActivity(),
         private const val TAG = "VRVideoPlayer"
 
         /*
-         * Чувствительность гироскопа.
-         * Если движение всё ещё медленное — увеличь до 5.0f или 6.0f.
+         * Чувствительность Android SensorManager.
+         * В режиме CardboardStereo основной трекер головы находится в Renderer.cpp
+         * через CardboardHeadTracker. Эти значения нужны как fallback для MonoLeft/MonoRight.
          */
         private const val YAW_SENSITIVITY = 4.0f
         private const val PITCH_SENSITIVITY = 4.0f
@@ -55,37 +55,28 @@ class MainActivity : AppCompatActivity(),
 
     /*
      * IP компьютера/сервера.
-     * Не ставить 127.0.0.1 — на телефоне это сам телефон.
+     * 127.0.0.1 на телефоне означает сам телефон, поэтому сюда нужен LAN IP сервера.
      */
     private val serverIp = "192.168.1.104"
 
     /*
-     * По твоему index.html VR WebSocket работает на 8071:
+     * VR WebSocket на сервере:
      * ws://host:8071/vr-view-ws
      */
     private val vrWsPort = 8071
 
     /*
-     * Для твоего 360-видео:
-     * InputLayout.Mono      — один 360 кадр.
-     * InputMode.Equirect360 — сферическое 360-видео.
-     * OutputMode.CardboardStereo — режим для двух глаз.
+     * Стартовый режим приложения.
+     * При каждом запуске сразу включаем обычное 360° mono-видео в режиме двух глаз.
+     * Если сервер потом пришлёт stereo_horiz/stereo_vert — переключимся без перезапуска.
      */
     private var inputLayout: InputLayout = InputLayout.Mono
     private var inputMode: InputMode = InputMode.Equirect360
-
-    /*
- * Сначала MonoLeft, чтобы исключить проблему Cardboard QR.
- * Когда видео заработает — можно вернуть OutputMode.CardboardStereo.
- */
-    private var outputMode: OutputMode = OutputMode.CardboardStereo ///для теста
+    private var outputMode: OutputMode = OutputMode.CardboardStereo
 
     private var multicastLock: WifiManager.MulticastLock? = null
     private var lastTouchCoordinates = arrayOf(1.0f, 0.0f)
 
-    /*
-     * Резервный гироскоп через Android SensorManager.
-     */
     private lateinit var sensorManager: SensorManager
     private var rotationSensor: Sensor? = null
 
@@ -101,55 +92,12 @@ class MainActivity : AppCompatActivity(),
 
         requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
 
-        fun radiusToFov(radius: Float): Float {
-            val r = radius.coerceIn(0f, 300f)
-
-            return if (r <= 150f) {
-                val t = r / 150f
-                120f + (90f - 120f) * t
-            } else {
-                val t = (r - 150f) / 150f
-                90f + (35f - 90f) * t
-            }
-        }
-
-        fun lookAtFromServer(
-            yaw: Float,
-            pitch: Float,
-            radius: Float,
-            duration: Int
-        ) {
-            if (nativeApp == 0L) {
-                Log.w(TAG, "lookAtFromServer ignored: nativeApp=0")
-                return
-            }
-
-            val fov = radiusToFov(radius)
-
-            Log.d(
-                TAG,
-                "lookAtFromServer yaw=$yaw pitch=$pitch radius=$radius fov=$fov duration=$duration"
-            )
-
-            NativeLibrary.nativeLookAtPoint(
-                nativeApp,
-                yaw,
-                pitch,
-                fov,
-                duration
-            )
-        }
-
         acquireMulticastLock()
 
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
 
-        /*
-         * Датчик поворота Android.
-         */
         sensorManager = getSystemService(Context.SENSOR_SERVICE) as SensorManager
-
         rotationSensor =
             sensorManager.getDefaultSensor(Sensor.TYPE_GAME_ROTATION_VECTOR)
                 ?: sensorManager.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR)
@@ -157,10 +105,8 @@ class MainActivity : AppCompatActivity(),
         Log.d(TAG, "rotationSensor=${rotationSensor?.name}")
 
         /*
-         * ВАЖНО:
-         * Сначала создаём VideoTexturePlayer, Controller и nativeApp.
-         * Только потом вызываем glView.setRenderer().
-         * Иначе GLSurfaceView может вызвать onSurfaceCreated раньше nativeInit.
+         * Важно: сначала создаём VideoTexturePlayer, Controller и nativeApp.
+         * Потом подключаем GLSurfaceView renderer.
          */
         videoTexturePlayer = VideoTexturePlayer(
             context = this,
@@ -179,18 +125,11 @@ class MainActivity : AppCompatActivity(),
             controller
         )
 
-        NativeLibrary.nativeSetOptions(
-            nativeApp,
-            inputLayout.ordinal,
-            inputMode.ordinal,
-            outputMode.ordinal
-        )
-
         /*
-         * GLSurfaceView / OpenGL.
-         * У тебя shaders в Renderer.cpp используют #version 300 es,
-         * значит нужен OpenGL ES 3, а не 2.
+         * Первый стартовый setOptions. Он нужен до первого кадра.
          */
+        forceStart360CardboardDirect()
+
         glView = binding.surfaceView
         glView.setEGLContextClientVersion(3)
 
@@ -207,10 +146,9 @@ class MainActivity : AppCompatActivity(),
         }
 
         /*
-         * Тестовый клик:
-         * При нажатии на экран камера должна повернуться вправо.
-         * После проверки можно убрать или заменить обратно.
-
+         * Тестовый клик. Если он поворачивает камеру, значит nativeLookAtPoint и Renderer.cpp работают.
+         * Можно оставить для диагностики или потом закомментировать.
+         */
         glView.setOnClickListener {
             lookAtFromServer(
                 yaw = 90f,
@@ -219,23 +157,35 @@ class MainActivity : AppCompatActivity(),
                 duration = 1000
             )
         }
-        *
-        */
 
-        /*
-         * Запуск native/Cardboard части.
-         */
         NativeLibrary.nativeOnResume(nativeApp)
 
         /*
-         * WebSocket управления точкой.
-         * ВАЖНО: порт 8071, не 8070.
+         * Второй принудительный setOptions уже через GL-поток.
+         * Это исправляет ситуацию, когда после nativeOnResume Renderer остаётся в дефолтном MONO_LEFT/PLAIN_FOV.
          */
+        forceStart360CardboardOnGlThread()
+
         teacherControlClient = TeacherControlClient(
-            wsUrl = "ws://$serverIp:$vrWsPort/vr-view-ws"
-        ) { yaw, pitch, radius, duration ->
-            lookAtFromServer(yaw, pitch, radius, duration)
-        }
+            wsUrl = "ws://$serverIp:$vrWsPort/vr-view-ws",
+            onLookAt = { yaw: Float, pitch: Float, radius: Float, duration: Int ->
+                lookAtFromServer(
+                    yaw = yaw,
+                    pitch = pitch,
+                    radius = radius,
+                    duration = duration
+                )
+            },
+            onVideoMode = { newInputLayout: InputLayout,
+                            newInputMode: InputMode,
+                            newOutputMode: OutputMode ->
+                applyVideoModeFromServer(
+                    newInputLayout = newInputLayout,
+                    newInputMode = newInputMode,
+                    newOutputMode = newOutputMode
+                )
+            }
+        )
 
         teacherControlClient?.start()
 
@@ -246,13 +196,53 @@ class MainActivity : AppCompatActivity(),
         window.attributes = layout
 
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-
         volumeControlStream = AudioManager.STREAM_MUSIC
 
         Log.d(
             TAG,
             "Started with inputLayout=$inputLayout inputMode=$inputMode outputMode=$outputMode"
         )
+    }
+
+    private fun forceStart360CardboardDirect() {
+        inputLayout = InputLayout.Mono
+        inputMode = InputMode.Equirect360
+        outputMode = OutputMode.CardboardStereo
+
+        if (nativeApp != 0L) {
+            NativeLibrary.nativeSetOptions(
+                nativeApp,
+                inputLayout.ordinal,
+                inputMode.ordinal,
+                outputMode.ordinal
+            )
+
+            Log.d(TAG, "FORCE START MODE DIRECT: $inputLayout $inputMode $outputMode")
+        }
+    }
+
+    private fun forceStart360CardboardOnGlThread() {
+        inputLayout = InputLayout.Mono
+        inputMode = InputMode.Equirect360
+        outputMode = OutputMode.CardboardStereo
+
+        if (!::glView.isInitialized) {
+            Log.w(TAG, "forceStart360CardboardOnGlThread ignored: glView not initialized")
+            return
+        }
+
+        glView.queueEvent {
+            if (nativeApp != 0L) {
+                NativeLibrary.nativeSetOptions(
+                    nativeApp,
+                    inputLayout.ordinal,
+                    inputMode.ordinal,
+                    outputMode.ordinal
+                )
+
+                Log.d(TAG, "FORCE START MODE ON GL: $inputLayout $inputMode $outputMode")
+            }
+        }
     }
 
     fun closePlayer(view: View) {
@@ -367,68 +357,124 @@ class MainActivity : AppCompatActivity(),
             return
         }
 
+        if (!::glView.isInitialized) {
+            Log.w(TAG, "lookAtFromServer ignored: glView not initialized")
+            return
+        }
+
         val fov = radiusToFov(radius)
 
         Log.d(
             TAG,
-            "lookAtFromServer yaw=$yaw pitch=$pitch radius=$radius fov=$fov duration=$duration"
+            "lookAtFromServer RECEIVED yaw=$yaw pitch=$pitch radius=$radius fov=$fov duration=$duration"
         )
 
-        NativeLibrary.nativeLookAtPoint(
-            nativeApp,
-            yaw,
-            pitch,
-            fov,
-            duration
-        )
+        /*
+         * Важно: Renderer живёт на GL-потоке GLSurfaceView.
+         * Поэтому команду поворота отправляем через queueEvent.
+         */
+        glView.queueEvent {
+            if (nativeApp != 0L) {
+                Log.d(
+                    TAG,
+                    "lookAtFromServer SEND TO GL yaw=$yaw pitch=$pitch radius=$radius fov=$fov duration=$duration"
+                )
+
+                NativeLibrary.nativeLookAtPoint(
+                    nativeApp,
+                    yaw,
+                    pitch,
+                    fov,
+                    duration
+                )
+            }
+        }
+    }
+
+    private fun applyVideoModeFromServer(
+        newInputLayout: InputLayout,
+        newInputMode: InputMode,
+        newOutputMode: OutputMode
+    ) {
+        if (nativeApp == 0L) {
+            Log.w(TAG, "applyVideoModeFromServer ignored: nativeApp=0")
+            return
+        }
+
+        if (!::glView.isInitialized) {
+            Log.w(TAG, "applyVideoModeFromServer ignored: glView not initialized")
+            return
+        }
+
+        val changed =
+            inputLayout != newInputLayout ||
+                inputMode != newInputMode ||
+                outputMode != newOutputMode
+
+        if (!changed) {
+            Log.d(TAG, "applyVideoModeFromServer ignored: already $inputLayout $inputMode $outputMode")
+            return
+        }
+
+        inputLayout = newInputLayout
+        inputMode = newInputMode
+        outputMode = newOutputMode
+
+        Log.d(TAG, "applyVideoModeFromServer RECEIVED: $inputLayout $inputMode $outputMode")
+
+        glView.queueEvent {
+            if (nativeApp != 0L) {
+                NativeLibrary.nativeSetOptions(
+                    nativeApp,
+                    inputLayout.ordinal,
+                    inputMode.ordinal,
+                    outputMode.ordinal
+                )
+
+                Log.d(TAG, "applyVideoModeFromServer SEND TO GL: $inputLayout $inputMode $outputMode")
+            }
+        }
     }
 
     private fun setInputLayout(newLayout: InputLayout, menuItem: MenuItem) {
         if (newLayout == inputLayout) return
-
         inputLayout = newLayout
-
-        NativeLibrary.nativeSetOptions(
-            nativeApp,
-            inputLayout.ordinal,
-            inputMode.ordinal,
-            outputMode.ordinal
-        )
-
+        setNativeOptionsOnGlThread()
         menuItem.isChecked = true
         Log.d(TAG, "setInputLayout: $inputLayout")
     }
 
     private fun setInputMode(newMode: InputMode, menuItem: MenuItem) {
         if (newMode == inputMode) return
-
         inputMode = newMode
-
-        NativeLibrary.nativeSetOptions(
-            nativeApp,
-            inputLayout.ordinal,
-            inputMode.ordinal,
-            outputMode.ordinal
-        )
-
+        setNativeOptionsOnGlThread()
         menuItem.isChecked = true
         Log.d(TAG, "setInputMode: $inputMode")
     }
 
     private fun setOutputMode(newMode: OutputMode, menuItem: MenuItem) {
         if (newMode == outputMode) return
-
         outputMode = newMode
-
-        NativeLibrary.nativeSetOptions(
-            nativeApp,
-            inputLayout.ordinal,
-            inputMode.ordinal,
-            outputMode.ordinal
-        )
-
+        setNativeOptionsOnGlThread()
         menuItem.isChecked = true
         Log.d(TAG, "setOutputMode: $outputMode")
+    }
+
+    private fun setNativeOptionsOnGlThread() {
+        if (nativeApp == 0L || !::glView.isInitialized) return
+
+        glView.queueEvent {
+            if (nativeApp != 0L) {
+                NativeLibrary.nativeSetOptions(
+                    nativeApp,
+                    inputLayout.ordinal,
+                    inputMode.ordinal,
+                    outputMode.ordinal
+                )
+
+                Log.d(TAG, "setNativeOptionsOnGlThread: $inputLayout $inputMode $outputMode")
+            }
+        }
     }
 
     override fun onResume() {
@@ -460,7 +506,6 @@ class MainActivity : AppCompatActivity(),
         Log.d(TAG, "onPause()")
 
         sensorManager.unregisterListener(this)
-
         videoTexturePlayer.onPause()
 
         if (nativeApp != 0L) {
@@ -468,7 +513,6 @@ class MainActivity : AppCompatActivity(),
         }
 
         glView.onPause()
-
         super.onPause()
     }
 
@@ -495,7 +539,6 @@ class MainActivity : AppCompatActivity(),
         }
 
         releaseMulticastLock()
-
         super.onDestroy()
     }
 
@@ -521,15 +564,8 @@ class MainActivity : AppCompatActivity(),
             return
         }
 
-        SensorManager.getRotationMatrixFromVector(
-            rotationMatrix,
-            event.values
-        )
+        SensorManager.getRotationMatrixFromVector(rotationMatrix, event.values)
 
-        /*
-         * Оси для landscape.
-         * Если влево/вправо будет работать неправильно — ниже дам альтернативу.
-         */
         SensorManager.remapCoordinateSystem(
             rotationMatrix,
             SensorManager.AXIS_Y,
@@ -537,37 +573,26 @@ class MainActivity : AppCompatActivity(),
             remappedRotationMatrix
         )
 
-        SensorManager.getOrientation(
-            remappedRotationMatrix,
-            orientationAngles
-        )
+        SensorManager.getOrientation(remappedRotationMatrix, orientationAngles)
 
-        /*
-         * orientationAngles:
-         * [0] = yaw   — влево/вправо
-         * [1] = pitch — вверх/вниз
-         * [2] = roll  — наклон головы
-         */
         var yaw = orientationAngles[0]
         var pitch = orientationAngles[1]
         var roll = orientationAngles[2]
 
-        /*
-         * Усиление движения.
-         */
         yaw *= YAW_SENSITIVITY
         pitch *= PITCH_SENSITIVITY
         roll *= ROLL_SENSITIVITY
 
-        /*
-         * Не даём камере перевернуться вверх ногами.
-         */
         pitch = pitch.coerceIn(-1.45f, 1.45f)
 
+        /*
+         * Для CardboardStereo Renderer.cpp использует CardboardHeadTracker.
+         * Это останется fallback для MonoLeft/MonoRight.
+         */
         NativeLibrary.nativeSetManualRotation(
             nativeApp,
             yaw,
-            -pitch,
+            pitch,
             roll
         )
     }
@@ -617,7 +642,6 @@ class MainActivity : AppCompatActivity(),
     }
 
     private inner class Renderer : GLSurfaceView.Renderer {
-
         override fun onSurfaceCreated(gl10: GL10?, config: EGLConfig?) {
             Log.d(TAG, "Renderer.onSurfaceCreated")
 

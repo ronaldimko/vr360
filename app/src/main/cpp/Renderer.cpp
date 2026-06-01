@@ -121,6 +121,16 @@ static constexpr GLubyte trivial2DData[] = {0, 1};
  */
 static bool gCardboardReady = false;
 
+/*
+ * Серверная точка yaw/pitch должна быть временной:
+ * 1) плавно повернулись к точке;
+ * 2) немного удержали точку;
+ * 3) сбросили серверную базу, чтобы голова снова двигалась в нормальной системе координат.
+ */
+static constexpr uint64_t kLookAtHoldMs = 1500;
+static bool gLookAtHolding = false;
+static uint64_t gLookAtHoldStartMs = 0;
+
 static std::array<VRGuiButton, 10> vrGuiButtons{
         VRGuiButton(M_PI - 1 * VR_GUI_BUTTON_GRID, VR_GUI_BUTTON_PHI_0 - 1 * VR_GUI_BUTTON_GRID,
                     VR_GUI_DISTANCE, VR_GUI_BUTTON_SIZE, 0, 0, ButtonAction::RECENTER_2D,
@@ -185,7 +195,12 @@ Renderer::Renderer(JavaVM *vm,
     Cardboard_initializeAndroid(vm, javaContextObj);
     cardboardHeadTracker = CardboardHeadTrackerPointer(CardboardHeadTracker_create());
 
-    SetOptions(InputVideoLayout::MONO, InputVideoMode::PLAIN_FOV, OutputMode::MONO_LEFT);
+    /*
+     * Стартовый режим должен быть Cardboard, а не MONO_LEFT/PLAIN_FOV.
+     * Java тоже выставляет этот режим, но C++ не должен успевать стартовать
+     * в старом моно-режиме до первого nativeSetOptions().
+     */
+    SetOptions(InputVideoLayout::MONO, InputVideoMode::EQUIRECT_360, OutputMode::CARDBOARD_STEREO);
 }
 
 Renderer::~Renderer() {
@@ -223,6 +238,12 @@ void Renderer::LookAtPoint(float yawDeg, float pitchDeg, float fovDeg, int durat
     lookAtDurationMs = durationMs <= 0 ? 1 : static_cast<uint64_t>(durationMs);
     lookAtStartMs = GetBootTimeNano() / 1000000ULL;
     lookAtAnimating = true;
+
+    /*
+     * Новая команда отменяет предыдущее удержание.
+     */
+    gLookAtHolding = false;
+    gLookAtHoldStartMs = 0;
 
     LOG_DEBUG(
             "LookAtPoint yawDeg=%.2f pitchDeg=%.2f fovDeg=%.2f durationMs=%d",
@@ -782,12 +803,45 @@ float Renderer::SmoothStep(float t) {
 }
 
 void Renderer::UpdateLookAtAnimation() {
-    if (!useLookAtControl || !lookAtAnimating) {
+    if (!useLookAtControl) {
         return;
     }
 
     const uint64_t nowMs = GetBootTimeNano() / 1000000ULL;
-    const uint64_t elapsedMs = nowMs > lookAtStartMs ? nowMs - lookAtStartMs : 0;
+
+    /*
+     * Стадия 2: анимация уже завершена, но точка ещё удерживается.
+     * Это нужно, чтобы поворот был видимым и не сбрасывался мгновенно.
+     */
+    if (!lookAtAnimating && gLookAtHolding) {
+        const uint64_t holdElapsed =
+                nowMs > gLookAtHoldStartMs ? nowMs - gLookAtHoldStartMs : 0;
+
+        if (holdElapsed >= kLookAtHoldMs) {
+            gLookAtHolding = false;
+
+            /*
+             * Сбрасываем серверную базовую матрицу.
+             * После этого движение головой снова идёт без учёта последней точки сервера.
+             */
+            useLookAtControl = false;
+            controlFov = 90.0f;
+
+            LOG_DEBUG("LookAtPoint hold finished: reset server base rotation");
+        }
+
+        return;
+    }
+
+    if (!lookAtAnimating) {
+        return;
+    }
+
+    /*
+     * Стадия 1: плавный поворот к targetYaw/targetPitch/targetFov.
+     */
+    const uint64_t elapsedMs =
+            nowMs > lookAtStartMs ? nowMs - lookAtStartMs : 0;
 
     float t = static_cast<float>(elapsedMs) / static_cast<float>(lookAtDurationMs);
     t = SmoothStep(t);
@@ -803,6 +857,11 @@ void Renderer::UpdateLookAtAnimation() {
         controlPitch = targetPitch;
         controlFov = targetFov;
         lookAtAnimating = false;
+
+        gLookAtHolding = true;
+        gLookAtHoldStartMs = nowMs;
+
+        LOG_DEBUG("LookAtPoint animation finished: start hold");
     }
 }
 
@@ -1225,9 +1284,21 @@ void Renderer::UpdatePose(JNIEnv *env) {
                 glm::value_ptr(headOrientationQuat)
         );
 
+        /*
+         * ВАЖНО:
+         * CardboardHeadTracker_getPose() уже возвращает матрицу/кватернион в системе,
+         * пригодной для view-преобразования Cardboard. Инвертировать кватернион нельзя:
+         * тогда все движения становятся зеркальными:
+         *   вправо -> влево, влево -> вправо, вверх -> вниз, вниз -> вверх.
+         */
         viewMatrix = glm::toMat4(headOrientationQuat);
 
-        const glm::vec4 pointVector = NEG_Z_AXIS * viewMatrix;
+        /*
+         * Для вычисления yaw/pitch используем порядок GLM: matrix * vector.
+         * Это не инвертирует сам рендер, а только правильно считает направление взгляда
+         * для меню/жестов/диагностики.
+         */
+        const glm::vec4 pointVector = viewMatrix * NEG_Z_AXIS;
 
         pitch = asinf(pointVector.y);
 
@@ -1290,7 +1361,8 @@ void Renderer::UpdatePose(JNIEnv *env) {
 
         viewMatrix = rollMatrix * pitchMatrix * yawMatrix;
 
-        const glm::vec4 pointVector = NEG_Z_AXIS * viewMatrix;
+        /* GLM: transformedVector = matrix * vector. */
+        const glm::vec4 pointVector = viewMatrix * NEG_Z_AXIS;
 
         pitch = asinf(pointVector.y);
 
