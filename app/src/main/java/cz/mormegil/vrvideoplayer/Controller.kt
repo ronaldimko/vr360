@@ -2,47 +2,122 @@ package cz.mormegil.vrvideoplayer
 
 import android.media.AudioManager
 
+/**
+ * Controller отвечает за обработку команд от кнопок интерфейса/VR-меню.
+ *
+ * Он не рисует кнопки сам, а только получает номер действия action
+ * и выполняет нужное действие:
+ * - изменить громкость;
+ * - перемотать видео;
+ * - перейти назад/вперёд;
+ * - сбросить видео в начало.
+ */
 class Controller(
+    // Android-системный менеджер громкости.
+    // Через него меняем громкость STREAM_MUSIC.
     private val audioManager: AudioManager,
+
+    // Объект видеоплеера.
+    // Через него выполняем перемотку, rewind и другие действия с видео.
     private val videoTexturePlayer: VideoTexturePlayer
 ) {
+
+    // ------------------------------------------------------------
+    // ID кнопок / действий.
+    // Эти числа должны совпадать с ID кнопок,
+    // которые приходят из нативного C++ рендера или из UI.
+    // ------------------------------------------------------------
+
+    // Сброс 2D-режима / центрирование обычного экрана.
+    // Сейчас в executeButtonAction не используется.
     private val buttonRecenter2D: Int = 1
+
+    // Сброс направления взгляда по yaw.
+    // Обычно нужен для VR, чтобы текущий взгляд стал "центром".
+    // Сейчас в executeButtonAction не используется.
     private val buttonRecenterYaw: Int = 2
+
+    // Уменьшить громкость.
     private val buttonVolumeDown: Int = 3
+
+    // Увеличить громкость.
     private val buttonVolumeUp: Int = 4
+
+    // Открыть файл.
+    // Сейчас в executeButtonAction не используется.
     private val buttonOpenFile: Int = 5
+
+    // Воспроизведение.
+    // Сейчас в executeButtonAction не используется.
     private val buttonPlay: Int = 6
+
+    // Перемотка назад на 5 секунд.
     private val buttonBack: Int = 7
+
+    // Перемотка вперёд на 5 секунд.
     private val buttonForward: Int = 8
+
+    // Перемотать видео в начало.
     private val buttonRewind: Int = 9
+
+    // Пауза.
+    // Сейчас в executeButtonAction не используется.
     private val buttonPause: Int = 10
 
+    /**
+     * Выполнить действие по номеру кнопки.
+     *
+     * action — это ID действия.
+     * Например:
+     * 3 — уменьшить громкость;
+     * 4 — увеличить громкость;
+     * 7 — назад на 5 секунд;
+     * 8 — вперёд на 5 секунд;
+     * 9 — в начало видео.
+     */
     fun executeButtonAction(action: Int) {
         when (action) {
+
+            // ----------------------------------------------------
+            // Уменьшение громкости мультимедиа.
+            // ----------------------------------------------------
             buttonVolumeDown -> {
                 audioManager.adjustStreamVolume(
-                    AudioManager.STREAM_MUSIC,
-                    AudioManager.ADJUST_LOWER,
-                    0
+                    AudioManager.STREAM_MUSIC, // Меняем громкость именно музыки/видео.
+                    AudioManager.ADJUST_LOWER, // Уменьшить громкость на один шаг.
+                    0                           // Без отображения системного UI громкости.
                 )
             }
 
+            // ----------------------------------------------------
+            // Увеличение громкости мультимедиа.
+            // ----------------------------------------------------
             buttonVolumeUp -> {
                 audioManager.adjustStreamVolume(
-                    AudioManager.STREAM_MUSIC,
-                    AudioManager.ADJUST_RAISE,
-                    0
+                    AudioManager.STREAM_MUSIC, // Меняем громкость музыки/видео.
+                    AudioManager.ADJUST_RAISE, // Увеличить громкость на один шаг.
+                    0                           // Без системного окна громкости.
                 )
             }
 
+            // ----------------------------------------------------
+            // Перемотка вперёд на 5000 мс = 5 секунд.
+            // ----------------------------------------------------
             buttonForward -> {
                 videoTexturePlayer.seek(5000)
             }
 
+            // ----------------------------------------------------
+            // Перемотка назад на 5000 мс = 5 секунд.
+            // Отрицательное значение означает перемотку назад.
+            // ----------------------------------------------------
             buttonBack -> {
                 videoTexturePlayer.seek(-5000)
             }
 
+            // ----------------------------------------------------
+            // Перемотать видео в начало.
+            // ----------------------------------------------------
             buttonRewind -> {
                 videoTexturePlayer.rewind()
             }
