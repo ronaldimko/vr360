@@ -8,6 +8,9 @@ import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.RectF
+import android.os.Build
+import android.text.Html
+import android.text.Spanned
 import android.text.Layout
 import android.text.StaticLayout
 import android.text.TextPaint
@@ -540,6 +543,7 @@ class MainActivity : AppCompatActivity(),
             if (nativeApp != 0L) {
                 NativeLibrary.nativeShowTextMark(
                     nativeApp,
+                    mark.id,
                     pixels,
                     bitmapWidth,
                     bitmapHeight,
@@ -603,9 +607,21 @@ class MainActivity : AppCompatActivity(),
             textAlign = Paint.Align.LEFT
         }
 
+        /*
+         * Поддержка простых HTML-тегов от сервера:
+         * <b>жирный</b>, <i>курсив</i>, <br> перенос строки.
+         * Остальные неизвестные теги Android просто проигнорирует.
+         */
+        val spannedText: Spanned = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            Html.fromHtml(text, Html.FROM_HTML_MODE_LEGACY)
+        } else {
+            @Suppress("DEPRECATION")
+            Html.fromHtml(text)
+        }
+
         val textWidth = width - padding * 2
         val staticLayout = StaticLayout.Builder
-            .obtain(text, 0, text.length, textPaint, textWidth)
+            .obtain(spannedText, 0, spannedText.length, textPaint, textWidth)
             .setAlignment(Layout.Alignment.ALIGN_CENTER)
             .setLineSpacing(0f, 1.0f)
             .setIncludePad(false)

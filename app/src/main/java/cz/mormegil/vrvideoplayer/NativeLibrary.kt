@@ -55,6 +55,7 @@ object NativeLibrary {
      */
     external fun nativeShowTextMark(
         nativeApp: Long,
+        id: String,
         pixelsArgb: IntArray,
         bitmapWidth: Int,
         bitmapHeight: Int,

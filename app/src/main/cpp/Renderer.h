@@ -2,6 +2,8 @@
 #define VRVIDEOPLAYER_RENDERER_H
 
 #include <array>
+#include <string>
+#include <vector>
 
 #include <EGL/egl.h>
 #include <GLES/gl.h>
@@ -9,6 +11,7 @@
 #include <cardboard.h>
 
 #include "glm/mat4x4.hpp"
+#include "glm/vec3.hpp"
 
 #include "TexturedMesh.h"
 #include "GLUtils.h"
@@ -88,6 +91,7 @@ public:
      */
     void ShowTextMarkFromPixels(
             JNIEnv *env,
+            const std::string &markId,
             jintArray pixelsArgb,
             int bitmapWidth,
             int bitmapHeight,
@@ -144,12 +148,21 @@ private:
     GLuint videoTexture;
     GLuint renderTexture;
     GLuint buttonTexture;
+    GLuint textMarkIndicatorTexture = 0;
 
-    // Текстовая метка внутри сферы. Создаётся из Bitmap, пришедшего из Kotlin.
-    GLuint textMarkTexture = 0;
-    TexturedMesh textMarkMesh;
-    bool textMarkVisible = false;
-    uint64_t textMarkHideAtMs = 0;
+    // Текстовые метки внутри сферы. Каждая создаётся из Bitmap, пришедшего из Kotlin.
+    struct TextMark3D {
+        std::string id;
+        GLuint texture = 0;
+        TexturedMesh mesh;
+        bool visible = false;
+        uint64_t hideAtMs = 0;
+        glm::vec3 direction = glm::vec3(0.0f, 0.0f, -1.0f);
+        TexturedMesh pointMesh;
+        TexturedMesh connectorMesh;
+    };
+
+    std::vector<TextMark3D> textMarks;
 
     GLuint framebuffer;
 
@@ -213,7 +226,7 @@ private:
 
     void RenderCardboardAlignLine();
 
-    void RenderTextMark(const glm::mat4 &mvpMatrix);
+    void RenderTextMarks(const glm::mat4 &mvpMatrix);
 
     void ExecuteButtonAction(const ButtonAction action, JNIEnv *env);
 

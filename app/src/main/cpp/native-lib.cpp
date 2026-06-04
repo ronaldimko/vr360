@@ -2,6 +2,7 @@
 #include <android/log.h>
 #include <android/native_window.h>
 #include <android/native_window_jni.h>
+#include <string>
 
 #include "logger.h"
 #include "Renderer.h"
@@ -74,6 +75,7 @@ Java_cz_mormegil_vrvideoplayer_NativeLibrary_nativeShowTextMark(
         JNIEnv *jenv,
         jobject /* this */,
         jlong native_app,
+        jstring markId,
         jintArray pixelsArgb,
         jint bitmapWidth,
         jint bitmapHeight,
@@ -90,8 +92,12 @@ Java_cz_mormegil_vrvideoplayer_NativeLibrary_nativeShowTextMark(
         return;
     }
 
+    const char *idChars = markId != nullptr ? jenv->GetStringUTFChars(markId, nullptr) : nullptr;
+    const std::string idString = idChars != nullptr ? std::string(idChars) : std::string();
+
     fromJava(native_app)->ShowTextMarkFromPixels(
             jenv,
+            idString,
             pixelsArgb,
             bitmapWidth,
             bitmapHeight,
@@ -104,6 +110,10 @@ Java_cz_mormegil_vrvideoplayer_NativeLibrary_nativeShowTextMark(
             markHeight,
             durationMs
     );
+
+    if (idChars != nullptr) {
+        jenv->ReleaseStringUTFChars(markId, idChars);
+    }
 }
 
 extern "C" JNIEXPORT void JNICALL

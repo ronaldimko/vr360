@@ -5,6 +5,8 @@
 #include <array>
 #include <fstream>
 #include <vector>
+#include <string>
+#include <vector>
 #include <algorithm>
 #include <cstdint>
 
@@ -16,6 +18,7 @@
 
 #include <cardboard.h>
 
+#include "glm/vec2.hpp"
 #include "glm/vec3.hpp"
 #include "glm/vec4.hpp"
 #include "glm/mat4x4.hpp"
@@ -333,6 +336,41 @@ void Renderer::InitStaticTexture(JNIEnv *env, GLuint &textureId, const std::stri
     CHECK_GL_ERROR("Texture load");
 }
 
+
+static void InitSolidRgbaTexture(GLuint &textureId,
+                                 unsigned char r,
+                                 unsigned char g,
+                                 unsigned char b,
+                                 unsigned char a) {
+    const unsigned char pixel[4] = {r, g, b, a};
+
+    if (textureId == 0) {
+        glGenTextures(1, &textureId);
+    }
+
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, textureId);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+
+    glTexImage2D(
+            GL_TEXTURE_2D,
+            0,
+            GL_RGBA,
+            1,
+            1,
+            0,
+            GL_RGBA,
+            GL_UNSIGNED_BYTE,
+            pixel
+    );
+
+    CHECK_GL_ERROR("InitSolidRgbaTexture");
+}
+
 void Renderer::OnSurfaceCreated(JNIEnv *env) {
     LOG_DEBUG("OnSurfaceCreated");
 
@@ -370,6 +408,9 @@ void Renderer::OnSurfaceCreated(JNIEnv *env) {
     CHECK_GL_ERROR("VR Gui program params");
 
     InitStaticTexture(env, buttonTexture, "buttons-texture.png");
+
+    // Текстура для точек и стрелок текстовых меток внутри сферы.
+    InitSolidRgbaTexture(textMarkIndicatorTexture, 0, 230, 255, 255);
 
     const GLuint vertexShader2D = LoadGLShader(GL_VERTEX_SHADER, kVertexShader2D);
     const GLuint fragmentShader2D = LoadGLShader(GL_FRAGMENT_SHADER, kFragmentShader2D);
@@ -488,15 +529,8 @@ void Renderer::DrawFrame(float videoPosition, JNIEnv *env) {
 
         CHECK_GL_ERROR("Render video");
 
-        if (textMarkVisible) {
-            const uint64_t nowMs = GetBootTimeNano() / 1000000ULL;
-            if (textMarkHideAtMs > 0 && nowMs >= textMarkHideAtMs) {
-                textMarkVisible = false;
-            } else {
-                RenderTextMark(mvpMatrix);
-                CHECK_GL_ERROR("Render text mark");
-            }
-        }
+        RenderTextMarks(mvpMatrix);
+        CHECK_GL_ERROR("Render text marks");
 
         if (vrProgressBarShown) {
             glUseProgram(program2D);
@@ -622,35 +656,31 @@ static glm::vec3 DirectionFromTextMarkPoint(float x,
     return glm::vec3(0.0f, 0.0f, -1.0f);
 }
 
-static TexturedMesh BuildTextMarkMesh(float x,
-                                      float y,
-                                      float z,
-                                      float yawDeg,
-                                      float pitchDeg,
-                                      float markWidth,
-                                      float markHeight) {
-    const glm::vec3 dir = DirectionFromTextMarkPoint(x, y, z, yawDeg, pitchDeg);
 
-    /*
-     * Метка находится внутри сферы, чуть ближе к зрителю, чем видео-сфера.
-     * Поэтому она выглядит как объект в VR-пространстве, а не как Android overlay.
-     */
-    const float distance = 0.78f;
-    const glm::vec3 center = dir * distance;
+static void TextMarkBasis(const glm::vec3 &direction,
+                          glm::vec3 &dir,
+                          glm::vec3 &right,
+                          glm::vec3 &up) {
+    dir = glm::normalize(direction);
 
     glm::vec3 worldUp(0.0f, 1.0f, 0.0f);
     if (std::fabs(glm::dot(worldUp, dir)) > 0.95f) {
         worldUp = glm::vec3(1.0f, 0.0f, 0.0f);
     }
 
-    glm::vec3 right = glm::normalize(glm::cross(worldUp, dir));
-    glm::vec3 up = glm::normalize(glm::cross(dir, right));
+    right = glm::normalize(glm::cross(worldUp, dir));
+    up = glm::normalize(glm::cross(dir, right));
+}
 
+static void TextMarkSize(float markWidth,
+                         float markHeight,
+                         float &halfWidth,
+                         float &halfHeight) {
     const float safeWidth = std::max(1.0f, markWidth);
     const float safeHeight = std::max(1.0f, markHeight);
     const float aspect = safeWidth / safeHeight;
 
-    float halfHeight = 0.16f;
+    halfHeight = 0.16f;
     if (safeHeight > 160.0f) {
         halfHeight = 0.20f;
     }
@@ -658,9 +688,55 @@ static TexturedMesh BuildTextMarkMesh(float x,
         halfHeight = 0.25f;
     }
 
-    float halfWidth = halfHeight * aspect;
+    halfWidth = halfHeight * aspect;
     halfWidth = glm::clamp(halfWidth, 0.18f, 0.70f);
     halfHeight = glm::clamp(halfHeight, 0.10f, 0.32f);
+}
+
+static glm::vec3 TextMarkAnchor(const glm::vec3 &direction) {
+    return glm::normalize(direction) * 0.82f;
+}
+
+static glm::vec3 TextMarkPanelCenter(const glm::vec3 &direction,
+                                     float markWidth,
+                                     float markHeight) {
+    glm::vec3 dir;
+    glm::vec3 right;
+    glm::vec3 up;
+    TextMarkBasis(direction, dir, right, up);
+
+    float halfWidth;
+    float halfHeight;
+    TextMarkSize(markWidth, markHeight, halfWidth, halfHeight);
+
+    /*
+     * Сам текстовый блок не ставим прямо на точку.
+     * Он сдвинут вправо по касательной, чтобы точка привязки была видна отдельно,
+     * как на web-просмотрщике: точка -> указатель -> окно с текстом.
+     */
+    const float gap = 0.055f;
+    return TextMarkAnchor(direction) + right * (halfWidth + gap);
+}
+
+static TexturedMesh BuildTextMarkMesh(float x,
+                                      float y,
+                                      float z,
+                                      float yawDeg,
+                                      float pitchDeg,
+                                      float markWidth,
+                                      float markHeight) {
+    const glm::vec3 direction = DirectionFromTextMarkPoint(x, y, z, yawDeg, pitchDeg);
+
+    glm::vec3 dir;
+    glm::vec3 right;
+    glm::vec3 up;
+    TextMarkBasis(direction, dir, right, up);
+
+    float halfWidth;
+    float halfHeight;
+    TextMarkSize(markWidth, markHeight, halfWidth, halfHeight);
+
+    const glm::vec3 center = TextMarkPanelCenter(direction, markWidth, markHeight);
 
     const glm::vec3 p0 = center - right * halfWidth + up * halfHeight; // top-left
     const glm::vec3 p1 = center + right * halfWidth + up * halfHeight; // top-right
@@ -675,9 +751,47 @@ static TexturedMesh BuildTextMarkMesh(float x,
     }};
 
     /*
-     * Bitmap.getPixels() отдаёт строки сверху вниз. Для glTexImage2D первая строка
-     * соответствует v=0, поэтому верхним вершинам ставим v=0.
+     * Текстура создана из Android Bitmap. Верх Bitmap = v=0.
+     * U развёрнут, потому что плоскость находится внутри сферы и видна с внутренней стороны.
      */
+    std::unique_ptr<GLfloat[]> uv{new GLfloat[8]{
+            1.0f, 0.0f,
+            0.0f, 0.0f,
+            0.0f, 1.0f,
+            1.0f, 1.0f
+    }};
+
+    std::unique_ptr<GLushort[]> indices{new GLushort[6]{
+            0, 2, 1,
+            0, 3, 2
+    }};
+
+    return TexturedMesh(GL_TRIANGLES, 6, std::move(pos), std::move(uv), std::move(indices));
+}
+
+static TexturedMesh BuildTextMarkPointMesh(const glm::vec3 &direction) {
+    glm::vec3 dir;
+    glm::vec3 right;
+    glm::vec3 up;
+    TextMarkBasis(direction, dir, right, up);
+
+    const glm::vec3 center = TextMarkAnchor(direction);
+
+    /* Крупнее, чем раньше: на телефоне маленькая точка была почти незаметна. */
+    const float half = 0.032f;
+
+    const glm::vec3 p0 = center - right * half + up * half;
+    const glm::vec3 p1 = center + right * half + up * half;
+    const glm::vec3 p2 = center + right * half - up * half;
+    const glm::vec3 p3 = center - right * half - up * half;
+
+    std::unique_ptr<GLfloat[]> pos{new GLfloat[12]{
+            p0.x, p0.y, p0.z,
+            p1.x, p1.y, p1.z,
+            p2.x, p2.y, p2.z,
+            p3.x, p3.y, p3.z
+    }};
+
     std::unique_ptr<GLfloat[]> uv{new GLfloat[8]{
             0.0f, 0.0f,
             1.0f, 0.0f,
@@ -693,15 +807,212 @@ static TexturedMesh BuildTextMarkMesh(float x,
     return TexturedMesh(GL_TRIANGLES, 6, std::move(pos), std::move(uv), std::move(indices));
 }
 
-void Renderer::RenderTextMark(const glm::mat4 &mvpMatrix) {
-    if (!textMarkVisible || textMarkTexture == 0) {
+static TexturedMesh BuildTextMarkConnectorMesh(const glm::vec3 &direction,
+                                               float markWidth,
+                                               float markHeight) {
+    glm::vec3 dir;
+    glm::vec3 right;
+    glm::vec3 up;
+    TextMarkBasis(direction, dir, right, up);
+
+    float halfWidth;
+    float halfHeight;
+    TextMarkSize(markWidth, markHeight, halfWidth, halfHeight);
+
+    const glm::vec3 anchor = TextMarkAnchor(direction);
+    const glm::vec3 center = TextMarkPanelCenter(direction, markWidth, markHeight);
+
+    /* Линия идёт от точки к левому краю окна. Сделана толще, чтобы явно связывать точку и текстовый блок. */
+    const glm::vec3 end = center - right * halfWidth;
+    const glm::vec3 line = end - anchor;
+
+    if (glm::length(line) < 0.001f) {
+        return TexturedMesh();
+    }
+
+    const glm::vec3 lineDir = glm::normalize(line);
+    const glm::vec3 normal = glm::normalize(glm::cross(dir, lineDir));
+    const float halfThickness = 0.014f;
+
+    const glm::vec3 p0 = anchor + normal * halfThickness;
+    const glm::vec3 p1 = end + normal * halfThickness;
+    const glm::vec3 p2 = end - normal * halfThickness;
+    const glm::vec3 p3 = anchor - normal * halfThickness;
+
+    std::unique_ptr<GLfloat[]> pos{new GLfloat[12]{
+            p0.x, p0.y, p0.z,
+            p1.x, p1.y, p1.z,
+            p2.x, p2.y, p2.z,
+            p3.x, p3.y, p3.z
+    }};
+
+    std::unique_ptr<GLfloat[]> uv{new GLfloat[8]{
+            0.0f, 0.0f,
+            1.0f, 0.0f,
+            1.0f, 1.0f,
+            0.0f, 1.0f
+    }};
+
+    std::unique_ptr<GLushort[]> indices{new GLushort[6]{
+            0, 2, 1,
+            0, 3, 2
+    }};
+
+    return TexturedMesh(GL_TRIANGLES, 6, std::move(pos), std::move(uv), std::move(indices));
+}
+
+static glm::vec3 CurrentViewDirectionFromMatrix(const glm::mat4 &viewMatrix) {
+    glm::vec4 v = viewMatrix * NEG_Z_AXIS;
+    glm::vec3 dir(v.x, v.y, v.z);
+
+    if (glm::length(dir) < 0.001f) {
+        return glm::vec3(0.0f, 0.0f, -1.0f);
+    }
+
+    return glm::normalize(dir);
+}
+
+/*
+ * Стрелка-подсказка направления.
+ *
+ * Она нужна, когда пользователь отвёл голову от точки:
+ * сама метка уже вне поля зрения, но стрелка на краю текущего взгляда
+ * показывает, в какую сторону надо повернуть голову, чтобы найти точку.
+ */
+static TexturedMesh BuildTextMarkDirectionIndicatorMesh(const glm::vec3 &targetDirection,
+                                                        const glm::mat4 &viewMatrix,
+                                                        float angleRad) {
+    /*
+     * Экранная навигационная стрелка внутри VR-вида.
+     *
+     * ВАЖНО:
+     * Раньше стрелка строилась как обычный 3D-объект рядом с меткой.
+     * Поэтому когда пользователь отворачивался, стрелка могла остаться в старом
+     * месте и больше не вести себя как указатель направления.
+     *
+     * Теперь алгоритм другой:
+     * 1) переводим направление на метку в текущие координаты камеры;
+     * 2) по X/Y в координатах камеры понимаем, куда находится метка относительно экрана;
+     * 3) строим стрелку в camera-space около края текущего взгляда;
+     * 4) переводим вершины обратно через inverse(viewMatrix), чтобы после умножения
+     *    на обычный MVP стрелка всегда оставалась в поле зрения и двигалась при повороте головы.
+     */
+
+    const glm::vec3 target = glm::normalize(targetDirection);
+
+    glm::vec3 targetCam = glm::vec3(viewMatrix * glm::vec4(target, 0.0f));
+    if (glm::length(targetCam) < 0.001f) {
+        targetCam = glm::vec3(0.0f, 0.0f, -1.0f);
+    }
+    targetCam = glm::normalize(targetCam);
+
+    /*
+     * В camera-space пользователь смотрит примерно вдоль -Z.
+     * X показывает вправо/влево, Y — вверх/вниз.
+     */
+    float sx = targetCam.x;
+    float sy = targetCam.y;
+
+    /*
+     * Если метка почти строго за спиной, X/Y могут быть около нуля.
+     * Тогда показываем разворот вправо как понятную подсказку.
+     */
+    if (std::fabs(sx) < 0.001f && std::fabs(sy) < 0.001f) {
+        sx = 1.0f;
+        sy = 0.0f;
+    }
+
+    glm::vec2 dir2 = glm::normalize(glm::vec2(sx, sy));
+
+    const float startAngle = glm::radians(10.0f);
+    const float endAngle = glm::radians(120.0f);
+    const float t = glm::clamp((angleRad - startAngle) / (endAngle - startAngle), 0.0f, 1.0f);
+
+    /*
+     * Позиция стрелки в текущем экране.
+     * Чем дальше точка от центра взгляда, тем ближе стрелка к краю.
+     */
+    const float screenRadius = 0.16f + 0.30f * t;
+    glm::vec2 center2 = dir2 * screenRadius;
+
+    /* Ограничиваем стрелку, чтобы она не вылезала за видимую область каждого глаза. */
+    center2.x = glm::clamp(center2.x, -0.46f, 0.46f);
+    center2.y = glm::clamp(center2.y, -0.34f, 0.34f);
+
+    /*
+     * Строим стрелку в camera-space на расстоянии перед камерой.
+     * Потом переведём её в world-space через inverse(viewMatrix).
+     */
+    const float z = -0.72f;
+    const glm::vec3 center(center2.x, center2.y, z);
+    const glm::vec3 arrowDir(dir2.x, dir2.y, 0.0f);
+    const glm::vec3 side(-dir2.y, dir2.x, 0.0f);
+
+    /* Нормальная стрелка: хвост + широкий наконечник. */
+    const float totalLength = 0.22f;
+    const float shaftLength = 0.13f;
+    const float shaftHalfWidth = 0.018f;
+    const float headHalfWidth = 0.060f;
+
+    const glm::vec3 tailCenter = center - arrowDir * (totalLength * 0.50f);
+    const glm::vec3 shaftEndCenter = tailCenter + arrowDir * shaftLength;
+    const glm::vec3 nose = center + arrowDir * (totalLength * 0.50f);
+
+    glm::vec3 camVerts[7] = {
+            tailCenter + side * shaftHalfWidth,
+            shaftEndCenter + side * shaftHalfWidth,
+            shaftEndCenter + side * headHalfWidth,
+            nose,
+            shaftEndCenter - side * headHalfWidth,
+            shaftEndCenter - side * shaftHalfWidth,
+            tailCenter - side * shaftHalfWidth
+    };
+
+    const glm::mat4 invView = glm::inverse(viewMatrix);
+    glm::vec3 worldVerts[7];
+    for (int i = 0; i < 7; ++i) {
+        const glm::vec4 w = invView * glm::vec4(camVerts[i], 1.0f);
+        worldVerts[i] = glm::vec3(w.x, w.y, w.z);
+    }
+
+    std::unique_ptr<GLfloat[]> pos{new GLfloat[21]{
+            worldVerts[0].x, worldVerts[0].y, worldVerts[0].z,
+            worldVerts[1].x, worldVerts[1].y, worldVerts[1].z,
+            worldVerts[2].x, worldVerts[2].y, worldVerts[2].z,
+            worldVerts[3].x, worldVerts[3].y, worldVerts[3].z,
+            worldVerts[4].x, worldVerts[4].y, worldVerts[4].z,
+            worldVerts[5].x, worldVerts[5].y, worldVerts[5].z,
+            worldVerts[6].x, worldVerts[6].y, worldVerts[6].z
+    }};
+
+    std::unique_ptr<GLfloat[]> uv{new GLfloat[14]{
+            0.0f, 0.5f,
+            0.45f, 0.5f,
+            0.55f, 0.0f,
+            1.0f, 0.5f,
+            0.55f, 1.0f,
+            0.45f, 0.5f,
+            0.0f, 0.5f
+    }};
+
+    std::unique_ptr<GLushort[]> indices{new GLushort[9]{
+            0, 6, 1,
+            1, 6, 5,
+            2, 4, 3
+    }};
+
+    return TexturedMesh(GL_TRIANGLES, 9, std::move(pos), std::move(uv), std::move(indices));
+}
+
+void Renderer::RenderTextMarks(const glm::mat4 &mvpMatrix) {
+    if (textMarks.empty()) {
         return;
     }
 
-    glUseProgram(programVRGui);
-    glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, textMarkTexture);
+    const uint64_t nowMs = GetBootTimeNano() / 1000000ULL;
+    const glm::vec3 currentForward = CurrentViewDirectionFromMatrix(viewMatrix);
 
+    glUseProgram(programVRGui);
     glUniformMatrix4fv(
             programVRGuiParamMVPMatrix,
             1,
@@ -709,10 +1020,61 @@ void Renderer::RenderTextMark(const glm::mat4 &mvpMatrix) {
             glm::value_ptr(mvpMatrix)
     );
 
-    textMarkMesh.Render(programVRGuiParamPosition, programVRGuiParamUV);
+    for (TextMark3D &mark: textMarks) {
+        if (!mark.visible) {
+            continue;
+        }
+
+        if (mark.hideAtMs > 0 && nowMs >= mark.hideAtMs) {
+            mark.visible = false;
+            continue;
+        }
+
+        /*
+         * 1) Рисуем указатель-точку и линию к окну.
+         *    Линия/точка рисуются ДО текста, чтобы окно оставалось сверху,
+         *    но сама точка больше не перекрывается окном, потому что окно сдвинуто вправо.
+         */
+        if (textMarkIndicatorTexture != 0) {
+            glActiveTexture(GL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_2D, textMarkIndicatorTexture);
+            mark.connectorMesh.Render(programVRGuiParamPosition, programVRGuiParamUV);
+            mark.pointMesh.Render(programVRGuiParamPosition, programVRGuiParamUV);
+        }
+
+        /*
+         * 2) Рисуем сам текст внутри сферы.
+         */
+        if (mark.texture != 0) {
+            glActiveTexture(GL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_2D, mark.texture);
+            mark.mesh.Render(programVRGuiParamPosition, programVRGuiParamUV);
+        }
+
+        /*
+         * 3) Стрелка направления.
+         *
+         * Она появляется не только когда метка полностью пропала, а уже когда
+         * пользователь заметно отвернулся от точки. Чем дальше метка от центра
+         * взгляда, тем ближе стрелка к краю поля зрения.
+         */
+        const glm::vec3 markDir = glm::normalize(mark.direction);
+        const float visibleDot = glm::clamp(glm::dot(currentForward, markDir), -1.0f, 1.0f);
+        const float angleToMark = std::acos(visibleDot);
+
+        if (angleToMark > glm::radians(12.0f) && textMarkIndicatorTexture != 0) {
+            TexturedMesh indicatorMesh =
+                    BuildTextMarkDirectionIndicatorMesh(markDir, viewMatrix, angleToMark);
+
+            glActiveTexture(GL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_2D, textMarkIndicatorTexture);
+            indicatorMesh.Render(programVRGuiParamPosition, programVRGuiParamUV);
+        }
+    }
 }
 
 void Renderer::ShowTextMarkFromPixels(JNIEnv *env,
+                                      const std::string &markId,
                                       jintArray pixelsArgb,
                                       int bitmapWidth,
                                       int bitmapHeight,
@@ -753,12 +1115,30 @@ void Renderer::ShowTextMarkFromPixels(JNIEnv *env,
 
     env->ReleaseIntArrayElements(pixelsArgb, src, JNI_ABORT);
 
-    if (textMarkTexture == 0) {
-        glGenTextures(1, &textMarkTexture);
+    const std::string safeId = markId.empty()
+                               ? std::string("mark_") + std::to_string(GetBootTimeNano())
+                               : markId;
+
+    TextMark3D *target = nullptr;
+    for (TextMark3D &mark: textMarks) {
+        if (mark.id == safeId) {
+            target = &mark;
+            break;
+        }
+    }
+
+    if (target == nullptr) {
+        textMarks.emplace_back();
+        target = &textMarks.back();
+        target->id = safeId;
+    }
+
+    if (target->texture == 0) {
+        glGenTextures(1, &target->texture);
     }
 
     glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, textMarkTexture);
+    glBindTexture(GL_TEXTURE_2D, target->texture);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
@@ -776,15 +1156,19 @@ void Renderer::ShowTextMarkFromPixels(JNIEnv *env,
             rgba.data()
     );
 
-    textMarkMesh = BuildTextMarkMesh(x, y, z, yawDeg, pitchDeg, markWidth, markHeight);
-    textMarkVisible = true;
+    target->direction = DirectionFromTextMarkPoint(x, y, z, yawDeg, pitchDeg);
+    target->mesh = BuildTextMarkMesh(x, y, z, yawDeg, pitchDeg, markWidth, markHeight);
+    target->pointMesh = BuildTextMarkPointMesh(target->direction);
+    target->connectorMesh = BuildTextMarkConnectorMesh(target->direction, markWidth, markHeight);
+    target->visible = true;
 
     const uint64_t nowMs = GetBootTimeNano() / 1000000ULL;
     const int safeDuration = durationMs <= 0 ? 5000 : durationMs;
-    textMarkHideAtMs = nowMs + static_cast<uint64_t>(safeDuration);
+    target->hideAtMs = nowMs + static_cast<uint64_t>(safeDuration);
 
     LOG_DEBUG(
-            "ShowTextMarkFromPixels: %dx%d point=(%.3f,%.3f,%.3f) yaw=%.2f pitch=%.2f duration=%d",
+            "ShowTextMarkFromPixels: id=%s %dx%d point=(%.3f,%.3f,%.3f) yaw=%.2f pitch=%.2f duration=%d total=%zu",
+            safeId.c_str(),
             bitmapWidth,
             bitmapHeight,
             x,
@@ -792,16 +1176,19 @@ void Renderer::ShowTextMarkFromPixels(JNIEnv *env,
             z,
             yawDeg,
             pitchDeg,
-            safeDuration
+            safeDuration,
+            textMarks.size()
     );
 
     CHECK_GL_ERROR("ShowTextMarkFromPixels");
 }
 
 void Renderer::ClearTextMarks() {
-    textMarkVisible = false;
-    textMarkHideAtMs = 0;
-    LOG_DEBUG("ClearTextMarks");
+    for (TextMark3D &mark: textMarks) {
+        mark.visible = false;
+        mark.hideAtMs = 0;
+    }
+    LOG_DEBUG("ClearTextMarks all");
 }
 
 bool Renderer::UpdateDeviceParams() {
