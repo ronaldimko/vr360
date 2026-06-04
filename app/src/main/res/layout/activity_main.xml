@@ -11,6 +11,30 @@
         android:layout_height="fill_parent"
         android:layout_gravity="top" />
 
+
+    <!--
+        Сообщение, полученное с сервера по WebSocket.
+        Показывается только при сообщении text-mark / message и скрывается через duration.
+    -->
+    <TextView
+        android:id="@+id/server_message_text"
+        android:layout_width="420dp"
+        android:layout_height="wrap_content"
+        android:layout_centerInParent="true"
+        android:background="@drawable/server_message_background"
+        android:elevation="16dp"
+        android:gravity="center"
+        android:maxLines="6"
+        android:paddingStart="28dp"
+        android:paddingTop="22dp"
+        android:paddingEnd="28dp"
+        android:paddingBottom="22dp"
+        android:textColor="#FFFFFFFF"
+        android:textSize="24sp"
+        android:textStyle="bold"
+        android:visibility="gone"
+        tools:text="Посмотрите сюда" />
+
     <!--
         Кнопка закрытия оставлена.
         Кнопка настроек полностью убрана: формат видео теперь выбирается автоматически

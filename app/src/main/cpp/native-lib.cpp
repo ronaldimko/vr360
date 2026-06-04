@@ -68,6 +68,57 @@ Java_cz_mormegil_vrvideoplayer_NativeLibrary_nativeLookAtPoint(
     );
 }
 
+
+extern "C" JNIEXPORT void JNICALL
+Java_cz_mormegil_vrvideoplayer_NativeLibrary_nativeShowTextMark(
+        JNIEnv *jenv,
+        jobject /* this */,
+        jlong native_app,
+        jintArray pixelsArgb,
+        jint bitmapWidth,
+        jint bitmapHeight,
+        jfloat x,
+        jfloat y,
+        jfloat z,
+        jfloat yawDeg,
+        jfloat pitchDeg,
+        jfloat markWidth,
+        jfloat markHeight,
+        jint durationMs) {
+    if (native_app == 0) {
+        LOG_ERROR("nativeShowTextMark: native_app is null");
+        return;
+    }
+
+    fromJava(native_app)->ShowTextMarkFromPixels(
+            jenv,
+            pixelsArgb,
+            bitmapWidth,
+            bitmapHeight,
+            x,
+            y,
+            z,
+            yawDeg,
+            pitchDeg,
+            markWidth,
+            markHeight,
+            durationMs
+    );
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_cz_mormegil_vrvideoplayer_NativeLibrary_nativeClearTextMarks(
+        JNIEnv * /* jenv */,
+        jobject /* this */,
+        jlong native_app) {
+    if (native_app == 0) {
+        LOG_ERROR("nativeClearTextMarks: native_app is null");
+        return;
+    }
+
+    fromJava(native_app)->ClearTextMarks();
+}
+
 extern "C" JNIEXPORT void JNICALL
 Java_cz_mormegil_vrvideoplayer_NativeLibrary_nativeOnResume(
         JNIEnv * /* env */,

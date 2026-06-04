@@ -82,6 +82,28 @@ public:
 
     void OnVideoSizeChanged(int width, int height);
 
+    /**
+     * Показать текстовую метку внутри VR-сферы.
+     * pixelsArgb — массив Android ARGB_8888 из Kotlin Bitmap.getPixels().
+     */
+    void ShowTextMarkFromPixels(
+            JNIEnv *env,
+            jintArray pixelsArgb,
+            int bitmapWidth,
+            int bitmapHeight,
+            float x,
+            float y,
+            float z,
+            float yawDeg,
+            float pitchDeg,
+            float markWidth,
+            float markHeight,
+            int durationMs
+    );
+
+    /** Скрыть текущую текстовую метку. */
+    void ClearTextMarks();
+
 
 private:
     JavaInterface javaInterface;
@@ -122,6 +144,12 @@ private:
     GLuint videoTexture;
     GLuint renderTexture;
     GLuint buttonTexture;
+
+    // Текстовая метка внутри сферы. Создаётся из Bitmap, пришедшего из Kotlin.
+    GLuint textMarkTexture = 0;
+    TexturedMesh textMarkMesh;
+    bool textMarkVisible = false;
+    uint64_t textMarkHideAtMs = 0;
 
     GLuint framebuffer;
 
@@ -184,6 +212,8 @@ private:
     void RenderPointer();
 
     void RenderCardboardAlignLine();
+
+    void RenderTextMark(const glm::mat4 &mvpMatrix);
 
     void ExecuteButtonAction(const ButtonAction action, JNIEnv *env);
 

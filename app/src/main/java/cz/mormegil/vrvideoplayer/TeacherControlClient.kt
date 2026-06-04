@@ -15,6 +15,35 @@ import kotlin.math.asin
 import kotlin.math.atan2
 import kotlin.math.sqrt
 
+/**
+ * Текстовая метка, полученная от сервера по WebSocket.
+ *
+ * Серверный формат по документации:
+ * {
+ *   "type": "text-mark",
+ *   "id": "mark1",
+ *   "x": 0,
+ *   "y": 0.2,
+ *   "z": 1,
+ *   "width": 320,
+ *   "height": 120,
+ *   "duration": 5000,
+ *   "text": "Посмотрите сюда"
+ * }
+ */
+data class ServerTextMark(
+    val id: String,
+    val text: String,
+    val x: Float?,
+    val y: Float?,
+    val z: Float?,
+    val yaw: Float?,
+    val pitch: Float?,
+    val width: Int,
+    val height: Int,
+    val durationMs: Int
+)
+
 class TeacherControlClient(
     private val wsUrl: String,
     private val onLookAt: (yaw: Float, pitch: Float, radius: Float, duration: Int) -> Unit,
@@ -22,7 +51,9 @@ class TeacherControlClient(
         inputLayout: InputLayout,
         inputMode: InputMode,
         outputMode: OutputMode
-    ) -> Unit
+    ) -> Unit,
+    private val onTextMark: (mark: ServerTextMark) -> Unit,
+    private val onTextMarkClear: () -> Unit
 ) {
     private val tag = "TeacherControlClient"
 
@@ -63,14 +94,9 @@ class TeacherControlClient(
             override fun onOpen(webSocket: WebSocket, response: Response) {
                 Log.d(tag, "WebSocket connected")
 
-                /*
-                 * Небольшой hello от Android-клиента.
-                 * Если сервер его игнорирует — ничего страшного.
-                 * Если сервер ведёт список клиентов — так проще увидеть подключение в логах.
-                 */
                 webSocket.send(
                     """
-                    {"type":"android_hello","client":"vrvideoplayer","supports":["yaw_pitch","xyz","video_mode"]}
+                    {"type":"android_hello","client":"vrvideoplayer","supports":["yaw_pitch","xyz","video_mode","text-mark"]}
                     """.trimIndent()
                 )
             }
@@ -104,29 +130,32 @@ class TeacherControlClient(
         try {
             Log.d(tag, "WS raw message handleMessage: $text")
 
-            /*
-             * Формат query:
-             * /vr-view?yaw=90&pitch=0&radius=150&duration=1000
-             * /vr-view?x=-150&y=0&z=0&radius=150&duration=1000
-             * yaw=90&pitch=0
-             * x=-150&y=0&z=0
-             */
             if (looksLikeQuery(text)) {
                 handleQueryStringMessage(text)
                 return
             }
 
             val root = JSONObject(text)
+            val type = root.optString("type", "").lowercase()
 
-            if (root.optString("type") == "hello") {
+            if (type == "hello") {
                 Log.d(tag, "WS hello")
                 return
             }
 
-            /*
-             * Сначала применяем режим видео.
-             * return не делаем: в одном JSON могут прийти и режим, и yaw/pitch/x/y/z.
-             */
+            // ВАЖНО: text-mark содержит x/y/z, но это НЕ команда поворота камеры.
+            // Поэтому обрабатываем его до handleLookAtMessage() и делаем return.
+            if (type == "text-mark" || type == "overlay_message" || type == "message") {
+                handleTextMarkMessage(root)
+                return
+            }
+
+            if (type == "text-mark-clear" || type == "overlay_message_clear" || type == "message-clear") {
+                Log.d(tag, "WS text mark clear")
+                mainHandler.post { onTextMarkClear() }
+                return
+            }
+
             if (isVideoModeMessage(root)) {
                 handleVideoModeMessage(root)
             }
@@ -139,16 +168,18 @@ class TeacherControlClient(
 
     private fun looksLikeQuery(text: String): Boolean {
         if (text.contains("?")) return true
+        if (text.contains("message=") || text.contains("text=")) return true
         if (text.contains("yaw=") && text.contains("pitch=")) return true
         if (text.contains("x=") && text.contains("y=") && text.contains("z=")) return true
         return false
     }
 
     private fun isVideoModeMessage(json: JSONObject): Boolean {
-        if (json.optString("type") == "video_mode") return true
-        if (json.has("videoMode")) return true
+        val type = json.optString("type", "").lowercase()
+        if (type == "video_mode" || type == "video-projection") return true
         if (json.has("video_projection")) return true
         if (json.has("videoProjection")) return true
+        if (json.has("videoMode")) return true
         if (json.has("projection")) return true
         if (json.has("layout")) return true
         if (json.has("inputMode")) return true
@@ -159,32 +190,23 @@ class TeacherControlClient(
     }
 
     private fun handleVideoModeMessage(root: JSONObject) {
-        val videoMode = root.optString(
-            "videoMode",
-            root.optString(
-                "video_projection",
-                root.optString("videoProjection", "")
-            )
+        val videoProjection = root.optString(
+            "video_projection",
+            root.optString("videoProjection", "")
         ).lowercase()
 
-        val projection = root.optString(
-            "projection",
-            root.optString(
-                "video_projection",
-                root.optString("videoProjection", "")
-            )
-        ).lowercase()
-
+        val videoMode = root.optString("videoMode", videoProjection).lowercase()
+        val projection = root.optString("projection", videoProjection).lowercase()
         val inputModeRaw = root.optString("inputMode", "").lowercase()
 
         val layout = root.optString(
             "layout",
-            root.optString("inputLayout", "")
+            root.optString("inputLayout", videoProjection)
         ).lowercase()
 
         val output = root.optString(
             "output",
-            root.optString("outputMode", "")
+            root.optString("outputMode", "cardboard")
         ).lowercase()
 
         val parsedInputMode = parseInputMode(videoMode, projection, inputModeRaw)
@@ -213,11 +235,11 @@ class TeacherControlClient(
         }.lowercase()
 
         return when (value) {
-            "360", "360_mono", "360_stereo", "360-stereo", "360 stereo",
+            "360", "360_mono", "360_stereo",
             "equirect360", "equirect_360", "equirectangular360", "equirectangular_360" ->
                 InputMode.Equirect360
 
-            "180", "180_mono", "180_stereo", "180-stereo", "180 stereo",
+            "180", "180_mono", "180_stereo",
             "equirect180", "equirect_180", "equirectangular180", "equirectangular_180" ->
                 InputMode.Equirect180
 
@@ -239,12 +261,11 @@ class TeacherControlClient(
         }.lowercase()
 
         return when (value) {
-            "mono", "360_mono", "180_mono" -> InputLayout.Mono
+            "mono", "360_mono", "180_mono", "360" -> InputLayout.Mono
 
             "stereo", "stereo_horiz", "stereo_horizontal",
             "side_by_side", "side-by-side", "sbs",
-            "360_stereo", "360-stereo", "360 stereo",
-            "180_stereo", "180-stereo", "180 stereo" -> InputLayout.StereoHoriz
+            "360_stereo", "180_stereo" -> InputLayout.StereoHoriz
 
             "stereo_vert", "stereo_vertical",
             "top_bottom", "top-bottom", "tb",
@@ -266,6 +287,51 @@ class TeacherControlClient(
             "mono_right", "right" -> OutputMode.MonoRight
             else -> OutputMode.CardboardStereo
         }
+    }
+
+    private fun handleTextMarkMessage(root: JSONObject) {
+        val rawText = root.optString(
+            "text",
+            root.optString("message", root.optString("html", root.optString("label", "")))
+        )
+
+        val text = cleanText(rawText)
+        if (text.isBlank()) {
+            Log.d(tag, "text-mark ignored: empty text")
+            return
+        }
+
+        val mark = ServerTextMark(
+            id = root.optString("id", "text_${System.currentTimeMillis()}"),
+            text = text,
+            x = root.optionalFloat("x"),
+            y = root.optionalFloat("y"),
+            z = root.optionalFloat("z"),
+            yaw = root.optionalFloat("yaw"),
+            pitch = root.optionalFloat("pitch"),
+            width = root.optInt("width", 420).coerceIn(160, 1024),
+            height = root.optInt("height", 140).coerceIn(80, 512),
+            durationMs = root.optInt("durationMs", root.optInt("duration", 5000)).coerceAtLeast(500)
+        )
+
+        Log.d(tag, "Parsed text-mark: $mark")
+        mainHandler.post { onTextMark(mark) }
+    }
+
+    private fun cleanText(value: String): String {
+        return value
+            .replace(Regex("<br\\s*/?>", RegexOption.IGNORE_CASE), "\n")
+            .replace(Regex("<[^>]*>"), "")
+            .replace("&nbsp;", " ")
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&amp;", "&")
+            .trim()
+    }
+
+    private fun JSONObject.optionalFloat(name: String): Float? {
+        if (!has(name) || isNull(name)) return null
+        return optDouble(name, Double.NaN).takeIf { !it.isNaN() }?.toFloat()
     }
 
     private fun handleLookAtMessage(root: JSONObject) {
@@ -315,6 +381,7 @@ class TeacherControlClient(
 
     private fun hasLookAtFields(json: JSONObject?): Boolean {
         if (json == null) return false
+        if (json.optString("type", "").lowercase() == "text-mark") return false
         if (json.has("yaw") && json.has("pitch")) return true
         if (json.has("x") && json.has("y") && json.has("z")) return true
         return false
@@ -340,12 +407,6 @@ class TeacherControlClient(
             val vectorRadius = sqrt(x * x + y * y + z * z)
             val safeRadius = if (vectorRadius > 0.001) vectorRadius else 1.0
 
-            /*
-             * Обратное преобразование к твоему index.html:
-             * x = -r * sin(yaw) * cos(pitch)
-             * y = -r * sin(pitch)
-             * z = -r * cos(yaw) * cos(pitch)
-             */
             var yaw = Math.toDegrees(atan2(-x, -z)).toFloat()
             if (yaw < 0f) yaw += 360f
 
@@ -385,6 +446,26 @@ class TeacherControlClient(
                     }
                 }
                 .toMap()
+
+            val textValue = params["text"] ?: params["message"]
+            if (!textValue.isNullOrBlank()) {
+                val mark = ServerTextMark(
+                    id = params["id"] ?: "text_${System.currentTimeMillis()}",
+                    text = cleanText(textValue),
+                    x = params["x"]?.toFloatOrNull(),
+                    y = params["y"]?.toFloatOrNull(),
+                    z = params["z"]?.toFloatOrNull(),
+                    yaw = params["yaw"]?.toFloatOrNull(),
+                    pitch = params["pitch"]?.toFloatOrNull(),
+                    width = params["width"]?.toIntOrNull() ?: 420,
+                    height = params["height"]?.toIntOrNull() ?: 140,
+                    durationMs = params["durationMs"]?.toIntOrNull()
+                        ?: params["duration"]?.toIntOrNull()
+                        ?: 5000
+                )
+                mainHandler.post { onTextMark(mark) }
+                return
+            }
 
             val json = JSONObject()
 

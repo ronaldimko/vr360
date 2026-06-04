@@ -4,6 +4,9 @@
 
 #include <array>
 #include <fstream>
+#include <vector>
+#include <algorithm>
+#include <cstdint>
 
 #include <android/asset_manager.h>
 #include <android/asset_manager_jni.h>
@@ -16,6 +19,7 @@
 #include "glm/vec3.hpp"
 #include "glm/vec4.hpp"
 #include "glm/mat4x4.hpp"
+#include "glm/geometric.hpp"
 #define GLM_ENABLE_EXPERIMENTAL
 #include "glm/gtx/quaternion.hpp"
 #include "glm/gtx/matrix_operation.hpp"
@@ -195,11 +199,6 @@ Renderer::Renderer(JavaVM *vm,
     Cardboard_initializeAndroid(vm, javaContextObj);
     cardboardHeadTracker = CardboardHeadTrackerPointer(CardboardHeadTracker_create());
 
-    /*
-     * Стартовый режим должен быть Cardboard, а не MONO_LEFT/PLAIN_FOV.
-     * Java тоже выставляет этот режим, но C++ не должен успевать стартовать
-     * в старом моно-режиме до первого nativeSetOptions().
-     */
     SetOptions(InputVideoLayout::MONO, InputVideoMode::EQUIRECT_360, OutputMode::CARDBOARD_STEREO);
 }
 
@@ -489,6 +488,16 @@ void Renderer::DrawFrame(float videoPosition, JNIEnv *env) {
 
         CHECK_GL_ERROR("Render video");
 
+        if (textMarkVisible) {
+            const uint64_t nowMs = GetBootTimeNano() / 1000000ULL;
+            if (textMarkHideAtMs > 0 && nowMs >= textMarkHideAtMs) {
+                textMarkVisible = false;
+            } else {
+                RenderTextMark(mvpMatrix);
+                CHECK_GL_ERROR("Render text mark");
+            }
+        }
+
         if (vrProgressBarShown) {
             glUseProgram(program2D);
             vrGuiProgressBar.render(program2DParamPosition);
@@ -571,6 +580,228 @@ void Renderer::RenderCardboardAlignLine() {
     );
 
     glDrawElements(GL_LINES, 2, GL_UNSIGNED_BYTE, trivial2DData);
+}
+
+
+static bool IsFinite3(float x, float y, float z) {
+    return std::isfinite(x) && std::isfinite(y) && std::isfinite(z);
+}
+
+static glm::vec3 DirectionFromTextMarkPoint(float x,
+                                            float y,
+                                            float z,
+                                            float yawDeg,
+                                            float pitchDeg) {
+    if (IsFinite3(x, y, z)) {
+        glm::vec3 v(x, y, z);
+        const float len = glm::length(v);
+        if (len > 0.001f) {
+            return glm::normalize(v);
+        }
+    }
+
+    if (std::isfinite(yawDeg) && std::isfinite(pitchDeg)) {
+        const float yawRad = glm::radians(yawDeg);
+        const float pitchRad = glm::radians(pitchDeg);
+
+        /*
+         * Та же система координат, что и в серверном / index.html:
+         * x = -r * sin(yaw) * cos(pitch)
+         * y = -r * sin(pitch)
+         * z = -r * cos(yaw) * cos(pitch)
+         */
+        glm::vec3 v(
+                -std::sin(yawRad) * std::cos(pitchRad),
+                -std::sin(pitchRad),
+                -std::cos(yawRad) * std::cos(pitchRad)
+        );
+        return glm::normalize(v);
+    }
+
+    // Если сервер прислал x=0,y=0,z=0 без yaw/pitch — показываем прямо перед зрителем.
+    return glm::vec3(0.0f, 0.0f, -1.0f);
+}
+
+static TexturedMesh BuildTextMarkMesh(float x,
+                                      float y,
+                                      float z,
+                                      float yawDeg,
+                                      float pitchDeg,
+                                      float markWidth,
+                                      float markHeight) {
+    const glm::vec3 dir = DirectionFromTextMarkPoint(x, y, z, yawDeg, pitchDeg);
+
+    /*
+     * Метка находится внутри сферы, чуть ближе к зрителю, чем видео-сфера.
+     * Поэтому она выглядит как объект в VR-пространстве, а не как Android overlay.
+     */
+    const float distance = 0.78f;
+    const glm::vec3 center = dir * distance;
+
+    glm::vec3 worldUp(0.0f, 1.0f, 0.0f);
+    if (std::fabs(glm::dot(worldUp, dir)) > 0.95f) {
+        worldUp = glm::vec3(1.0f, 0.0f, 0.0f);
+    }
+
+    glm::vec3 right = glm::normalize(glm::cross(worldUp, dir));
+    glm::vec3 up = glm::normalize(glm::cross(dir, right));
+
+    const float safeWidth = std::max(1.0f, markWidth);
+    const float safeHeight = std::max(1.0f, markHeight);
+    const float aspect = safeWidth / safeHeight;
+
+    float halfHeight = 0.16f;
+    if (safeHeight > 160.0f) {
+        halfHeight = 0.20f;
+    }
+    if (safeHeight > 260.0f) {
+        halfHeight = 0.25f;
+    }
+
+    float halfWidth = halfHeight * aspect;
+    halfWidth = glm::clamp(halfWidth, 0.18f, 0.70f);
+    halfHeight = glm::clamp(halfHeight, 0.10f, 0.32f);
+
+    const glm::vec3 p0 = center - right * halfWidth + up * halfHeight; // top-left
+    const glm::vec3 p1 = center + right * halfWidth + up * halfHeight; // top-right
+    const glm::vec3 p2 = center + right * halfWidth - up * halfHeight; // bottom-right
+    const glm::vec3 p3 = center - right * halfWidth - up * halfHeight; // bottom-left
+
+    std::unique_ptr<GLfloat[]> pos{new GLfloat[12]{
+            p0.x, p0.y, p0.z,
+            p1.x, p1.y, p1.z,
+            p2.x, p2.y, p2.z,
+            p3.x, p3.y, p3.z
+    }};
+
+    /*
+     * Bitmap.getPixels() отдаёт строки сверху вниз. Для glTexImage2D первая строка
+     * соответствует v=0, поэтому верхним вершинам ставим v=0.
+     */
+    std::unique_ptr<GLfloat[]> uv{new GLfloat[8]{
+            0.0f, 0.0f,
+            1.0f, 0.0f,
+            1.0f, 1.0f,
+            0.0f, 1.0f
+    }};
+
+    std::unique_ptr<GLushort[]> indices{new GLushort[6]{
+            0, 2, 1,
+            0, 3, 2
+    }};
+
+    return TexturedMesh(GL_TRIANGLES, 6, std::move(pos), std::move(uv), std::move(indices));
+}
+
+void Renderer::RenderTextMark(const glm::mat4 &mvpMatrix) {
+    if (!textMarkVisible || textMarkTexture == 0) {
+        return;
+    }
+
+    glUseProgram(programVRGui);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, textMarkTexture);
+
+    glUniformMatrix4fv(
+            programVRGuiParamMVPMatrix,
+            1,
+            GL_FALSE,
+            glm::value_ptr(mvpMatrix)
+    );
+
+    textMarkMesh.Render(programVRGuiParamPosition, programVRGuiParamUV);
+}
+
+void Renderer::ShowTextMarkFromPixels(JNIEnv *env,
+                                      jintArray pixelsArgb,
+                                      int bitmapWidth,
+                                      int bitmapHeight,
+                                      float x,
+                                      float y,
+                                      float z,
+                                      float yawDeg,
+                                      float pitchDeg,
+                                      float markWidth,
+                                      float markHeight,
+                                      int durationMs) {
+    if (pixelsArgb == nullptr || bitmapWidth <= 0 || bitmapHeight <= 0) {
+        LOG_ERROR("ShowTextMarkFromPixels: bad bitmap");
+        return;
+    }
+
+    const jsize arrayLength = env->GetArrayLength(pixelsArgb);
+    const int expectedLength = bitmapWidth * bitmapHeight;
+    if (arrayLength < expectedLength) {
+        LOG_ERROR("ShowTextMarkFromPixels: pixels array too small");
+        return;
+    }
+
+    jint *src = env->GetIntArrayElements(pixelsArgb, nullptr);
+    if (src == nullptr) {
+        LOG_ERROR("ShowTextMarkFromPixels: GetIntArrayElements failed");
+        return;
+    }
+
+    std::vector<unsigned char> rgba(static_cast<size_t>(expectedLength) * 4u);
+    for (int i = 0; i < expectedLength; ++i) {
+        const uint32_t c = static_cast<uint32_t>(src[i]); // Android ARGB: 0xAARRGGBB
+        rgba[i * 4 + 0] = static_cast<unsigned char>((c >> 16) & 0xFF); // R
+        rgba[i * 4 + 1] = static_cast<unsigned char>((c >> 8) & 0xFF);  // G
+        rgba[i * 4 + 2] = static_cast<unsigned char>(c & 0xFF);         // B
+        rgba[i * 4 + 3] = static_cast<unsigned char>((c >> 24) & 0xFF); // A
+    }
+
+    env->ReleaseIntArrayElements(pixelsArgb, src, JNI_ABORT);
+
+    if (textMarkTexture == 0) {
+        glGenTextures(1, &textMarkTexture);
+    }
+
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, textMarkTexture);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glTexImage2D(
+            GL_TEXTURE_2D,
+            0,
+            GL_RGBA,
+            bitmapWidth,
+            bitmapHeight,
+            0,
+            GL_RGBA,
+            GL_UNSIGNED_BYTE,
+            rgba.data()
+    );
+
+    textMarkMesh = BuildTextMarkMesh(x, y, z, yawDeg, pitchDeg, markWidth, markHeight);
+    textMarkVisible = true;
+
+    const uint64_t nowMs = GetBootTimeNano() / 1000000ULL;
+    const int safeDuration = durationMs <= 0 ? 5000 : durationMs;
+    textMarkHideAtMs = nowMs + static_cast<uint64_t>(safeDuration);
+
+    LOG_DEBUG(
+            "ShowTextMarkFromPixels: %dx%d point=(%.3f,%.3f,%.3f) yaw=%.2f pitch=%.2f duration=%d",
+            bitmapWidth,
+            bitmapHeight,
+            x,
+            y,
+            z,
+            yawDeg,
+            pitchDeg,
+            safeDuration
+    );
+
+    CHECK_GL_ERROR("ShowTextMarkFromPixels");
+}
+
+void Renderer::ClearTextMarks() {
+    textMarkVisible = false;
+    textMarkHideAtMs = 0;
+    LOG_DEBUG("ClearTextMarks");
 }
 
 bool Renderer::UpdateDeviceParams() {
@@ -1284,20 +1515,8 @@ void Renderer::UpdatePose(JNIEnv *env) {
                 glm::value_ptr(headOrientationQuat)
         );
 
-        /*
-         * ВАЖНО:
-         * CardboardHeadTracker_getPose() уже возвращает матрицу/кватернион в системе,
-         * пригодной для view-преобразования Cardboard. Инвертировать кватернион нельзя:
-         * тогда все движения становятся зеркальными:
-         *   вправо -> влево, влево -> вправо, вверх -> вниз, вниз -> вверх.
-         */
         viewMatrix = glm::toMat4(headOrientationQuat);
 
-        /*
-         * Для вычисления yaw/pitch используем порядок GLM: matrix * vector.
-         * Это не инвертирует сам рендер, а только правильно считает направление взгляда
-         * для меню/жестов/диагностики.
-         */
         const glm::vec4 pointVector = viewMatrix * NEG_Z_AXIS;
 
         pitch = asinf(pointVector.y);
@@ -1361,7 +1580,6 @@ void Renderer::UpdatePose(JNIEnv *env) {
 
         viewMatrix = rollMatrix * pitchMatrix * yawMatrix;
 
-        /* GLM: transformedVector = matrix * vector. */
         const glm::vec4 pointVector = viewMatrix * NEG_Z_AXIS;
 
         pitch = asinf(pointVector.y);

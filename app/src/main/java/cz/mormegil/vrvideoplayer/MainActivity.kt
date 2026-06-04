@@ -3,6 +3,14 @@ package cz.mormegil.vrvideoplayer
 import android.annotation.SuppressLint
 import android.content.Context
 import android.content.pm.ActivityInfo
+import android.graphics.Bitmap
+import android.graphics.Canvas
+import android.graphics.Color
+import android.graphics.Paint
+import android.graphics.RectF
+import android.text.Layout
+import android.text.StaticLayout
+import android.text.TextPaint
 import android.hardware.Sensor
 import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
@@ -12,22 +20,19 @@ import android.media.MediaPlayer
 import android.net.wifi.WifiManager
 import android.opengl.GLSurfaceView
 import android.os.Bundle
-import android.os.Handler
-import android.os.Looper
 import android.util.Log
+import android.view.MenuInflater
+import android.view.MenuItem
 import android.view.MotionEvent
 import android.view.View
 import android.view.WindowManager
 import androidx.appcompat.app.AppCompatActivity
+import androidx.appcompat.widget.PopupMenu
+import androidx.core.view.MenuCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import cz.mormegil.vrvideoplayer.databinding.ActivityMainBinding
-import okhttp3.OkHttpClient
-import okhttp3.Request
-import org.json.JSONArray
-import org.json.JSONObject
-import java.util.concurrent.TimeUnit
 import javax.microedition.khronos.egl.EGLConfig
 import javax.microedition.khronos.opengles.GL10
 
@@ -40,8 +45,8 @@ class MainActivity : AppCompatActivity(),
 
         /*
          * Чувствительность Android SensorManager.
-         * В CardboardStereo основной трекер головы находится в Renderer.cpp через CardboardHeadTracker.
-         * Эти значения остаются только для fallback-режимов MonoLeft/MonoRight.
+         * В режиме CardboardStereo основной трекер головы находится в Renderer.cpp
+         * через CardboardHeadTracker. Эти значения нужны как fallback для MonoLeft/MonoRight.
          */
         private const val YAW_SENSITIVITY = 4.0f
         private const val PITCH_SENSITIVITY = 4.0f
@@ -58,20 +63,20 @@ class MainActivity : AppCompatActivity(),
 
     /*
      * IP компьютера/сервера.
-     * 127.0.0.1 на телефоне означает сам телефон, поэтому здесь нужен LAN IP сервера.
+     * 127.0.0.1 на телефоне означает сам телефон, поэтому сюда нужен LAN IP сервера.
      */
     private val serverIp = "192.168.1.104"
 
-    /* HTTP API сервера 360. */
-    private val httpPort = 8070
-
-    /* WebSocket управления VR: ws://host:8071/vr-view-ws */
+    /*
+     * VR WebSocket на сервере:
+     * ws://host:8071/vr-view-ws
+     */
     private val vrWsPort = 8071
 
     /*
      * Стартовый режим приложения.
-     * По умолчанию всегда запускаем 360 mono в Cardboard.
-     * Если сервер сообщает, что запущено 180_stereo, приложение переключится автоматически.
+     * При каждом запуске сразу включаем обычное 360° mono-видео в режиме двух глаз.
+     * Если сервер потом пришлёт stereo_horiz/stereo_vert — переключимся без перезапуска.
      */
     private var inputLayout: InputLayout = InputLayout.Mono
     private var inputMode: InputMode = InputMode.Equirect360
@@ -86,21 +91,6 @@ class MainActivity : AppCompatActivity(),
     private val rotationMatrix = FloatArray(9)
     private val remappedRotationMatrix = FloatArray(9)
     private val orientationAngles = FloatArray(3)
-
-    private val httpClient = OkHttpClient.Builder()
-        .connectTimeout(2, TimeUnit.SECONDS)
-        .readTimeout(2, TimeUnit.SECONDS)
-        .retryOnConnectionFailure(true)
-        .build()
-
-    private val videoInfoHandler = Handler(Looper.getMainLooper())
-
-    private val videoInfoPollRunnable = object : Runnable {
-        override fun run() {
-            requestCurrentVideoInfoFromServer()
-            videoInfoHandler.postDelayed(this, 3000)
-        }
-    }
 
     @SuppressLint("ClickableViewAccessibility")
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -122,6 +112,10 @@ class MainActivity : AppCompatActivity(),
 
         Log.d(TAG, "rotationSensor=${rotationSensor?.name}")
 
+        /*
+         * Важно: сначала создаём VideoTexturePlayer, Controller и nativeApp.
+         * Потом подключаем GLSurfaceView renderer.
+         */
         videoTexturePlayer = VideoTexturePlayer(
             context = this,
             videoSizeChangedListener = this
@@ -139,7 +133,9 @@ class MainActivity : AppCompatActivity(),
             controller
         )
 
-        /* Первый режим до первого кадра: всегда 360 Cardboard. */
+        /*
+         * Первый стартовый setOptions. Он нужен до первого кадра.
+         */
         forceStart360CardboardDirect()
 
         glView = binding.surfaceView
@@ -158,14 +154,24 @@ class MainActivity : AppCompatActivity(),
         }
 
         /*
-         * На экране больше нет кнопки настроек.
-         * Ручное переключение режимов удалено из UI.
-         * Формат видео теперь приходит только с сервера.
+         * Тестовый клик. Если он поворачивает камеру, значит nativeLookAtPoint и Renderer.cpp работают.
+         * Можно оставить для диагностики или потом закомментировать.
          */
+        glView.setOnClickListener {
+            lookAtFromServer(
+                yaw = 90f,
+                pitch = 0f,
+                radius = 150f,
+                duration = 1000
+            )
+        }
 
         NativeLibrary.nativeOnResume(nativeApp)
 
-        /* Повторно фиксируем стартовый режим уже через GL-поток. */
+        /*
+         * Второй принудительный setOptions уже через GL-поток.
+         * Это исправляет ситуацию, когда после nativeOnResume Renderer остаётся в дефолтном MONO_LEFT/PLAIN_FOV.
+         */
         forceStart360CardboardOnGlThread()
 
         teacherControlClient = TeacherControlClient(
@@ -186,17 +192,16 @@ class MainActivity : AppCompatActivity(),
                     newInputMode = newInputMode,
                     newOutputMode = newOutputMode
                 )
+            },
+            onTextMark = { mark: ServerTextMark ->
+                showTextMarkInsideSphere(mark)
+            },
+            onTextMarkClear = {
+                clearTextMarksInsideSphere()
             }
         )
 
         teacherControlClient?.start()
-
-        /*
-         * Если Android включился уже после запуска видео на сервере,
-         * WebSocket-событие могло быть пропущено. Поэтому дополнительно опрашиваем
-         * /api/current-video-info и синхронизируем режим 360 / 180_stereo.
-         */
-        startCurrentVideoInfoPolling()
 
         enterImmersiveMode()
 
@@ -258,168 +263,89 @@ class MainActivity : AppCompatActivity(),
         finish()
     }
 
-    private fun startCurrentVideoInfoPolling() {
-        videoInfoHandler.removeCallbacks(videoInfoPollRunnable)
-        requestCurrentVideoInfoFromServer()
-        videoInfoHandler.postDelayed(videoInfoPollRunnable, 3000)
-    }
+    fun showSettings(view: View) {
+        val popup = PopupMenu(this, view)
+        val inflater: MenuInflater = popup.menuInflater
 
-    private fun stopCurrentVideoInfoPolling() {
-        videoInfoHandler.removeCallbacks(videoInfoPollRunnable)
-    }
+        inflater.inflate(R.menu.settings_menu, popup.menu)
+        MenuCompat.setGroupDividerEnabled(popup.menu, true)
 
-    private fun requestCurrentVideoInfoFromServer() {
-        Thread {
-            try {
-                val url = "http://$serverIp:$httpPort/api/current-video-info"
+        popup.menu.findItem(inputMode.menuItemId())?.isChecked = true
+        popup.menu.findItem(inputLayout.menuItemId())?.isChecked = true
+        popup.menu.findItem(outputMode.menuItemId())?.isChecked = true
 
-                val request = Request.Builder()
-                    .url(url)
-                    .get()
-                    .build()
-
-                httpClient.newCall(request).execute().use { response ->
-                    if (!response.isSuccessful) {
-                        Log.w(TAG, "current-video-info failed code=${response.code}")
-                        return@use
-                    }
-
-                    val body = response.body?.string()
-                    if (body.isNullOrBlank()) {
-                        Log.w(TAG, "current-video-info empty body")
-                        return@use
-                    }
-
-                    Log.d(TAG, "current-video-info: $body")
-                    applyVideoInfoJsonFromServer(JSONObject(body))
+        popup.setOnMenuItemClickListener { item: MenuItem ->
+            when (item.itemId) {
+                R.id.switch_viewer -> {
+                    NativeLibrary.nativeScanCardboardQr(nativeApp)
+                    true
                 }
-            } catch (e: Throwable) {
-                Log.w(TAG, "requestCurrentVideoInfoFromServer error: ${e.message}")
-            }
-        }.apply {
-            name = "vr-current-video-info"
-            start()
-        }
-    }
 
-    private fun applyVideoInfoJsonFromServer(json: JSONObject) {
-        val projection = findStringInJson(
-            json,
-            listOf(
-                "video_projection",
-                "videoProjection",
-                "projection",
-                "videoMode",
-                "inputMode",
-                "format",
-                "type"
-            )
-        )?.lowercase()?.trim().orEmpty()
-
-        if (projection.isBlank()) {
-            Log.d(TAG, "current-video-info has no projection field: $json")
-            return
-        }
-
-        val layoutRaw = findStringInJson(
-            json,
-            listOf("layout", "inputLayout", "stereo_layout", "stereoLayout")
-        )?.lowercase()?.trim().orEmpty()
-
-        val newOutputMode = OutputMode.CardboardStereo
-
-        val newInputMode: InputMode
-        val newInputLayout: InputLayout
-
-        when (projection) {
-            "360", "360_mono", "equirect360", "equirect_360", "equirectangular360", "equirectangular_360" -> {
-                newInputMode = InputMode.Equirect360
-                newInputLayout = parseLayoutForProjection(layoutRaw, InputLayout.Mono)
-            }
-
-            "360_stereo", "360 stereo", "360-stereo" -> {
-                newInputMode = InputMode.Equirect360
-                newInputLayout = parseLayoutForProjection(layoutRaw, InputLayout.StereoHoriz)
-            }
-
-            "180_stereo", "180 stereo", "180-stereo" -> {
-                newInputMode = InputMode.Equirect180
-                newInputLayout = parseLayoutForProjection(layoutRaw, InputLayout.StereoHoriz)
-            }
-
-            "180", "180_mono", "equirect180", "equirect_180", "equirectangular180", "equirectangular_180" -> {
-                newInputMode = InputMode.Equirect180
-                newInputLayout = parseLayoutForProjection(layoutRaw, InputLayout.Mono)
-            }
-
-            "panorama180", "panorama_180" -> {
-                newInputMode = InputMode.Panorama180
-                newInputLayout = parseLayoutForProjection(layoutRaw, InputLayout.Mono)
-            }
-
-            "panorama360", "panorama_360" -> {
-                newInputMode = InputMode.Panorama360
-                newInputLayout = parseLayoutForProjection(layoutRaw, InputLayout.Mono)
-            }
-
-            "plain", "plain_fov", "flat", "2d" -> {
-                newInputMode = InputMode.PlainFov
-                newInputLayout = InputLayout.Mono
-            }
-
-            else -> {
-                Log.w(TAG, "Unknown server video projection='$projection', keep current mode")
-                return
-            }
-        }
-
-        runOnUiThread {
-            applyVideoModeFromServer(
-                newInputLayout = newInputLayout,
-                newInputMode = newInputMode,
-                newOutputMode = newOutputMode
-            )
-        }
-    }
-
-    private fun parseLayoutForProjection(layout: String, defaultValue: InputLayout): InputLayout {
-        return when (layout.lowercase()) {
-            "mono", "360_mono", "180_mono" -> InputLayout.Mono
-            "stereo", "stereo_horiz", "stereo_horizontal", "side_by_side", "side-by-side", "sbs" ->
-                InputLayout.StereoHoriz
-            "stereo_vert", "stereo_vertical", "top_bottom", "top-bottom", "tb", "over_under", "over-under", "ou" ->
-                InputLayout.StereoVert
-            "anaglyph", "anaglyph_red_cyan" -> InputLayout.AnaglyphRedCyan
-            else -> defaultValue
-        }
-    }
-
-    private fun findStringInJson(json: JSONObject, keys: List<String>): String? {
-        for (key in keys) {
-            val value = json.opt(key)
-            if (value is String && value.isNotBlank()) return value
-        }
-
-        val iterator = json.keys()
-        while (iterator.hasNext()) {
-            when (val value = json.opt(iterator.next())) {
-                is JSONObject -> {
-                    val found = findStringInJson(value, keys)
-                    if (!found.isNullOrBlank()) return found
+                R.id.input_layout_mono -> {
+                    setInputLayout(InputLayout.Mono, item)
+                    true
                 }
-                is JSONArray -> {
-                    for (i in 0 until value.length()) {
-                        val item = value.opt(i)
-                        if (item is JSONObject) {
-                            val found = findStringInJson(item, keys)
-                            if (!found.isNullOrBlank()) return found
-                        }
-                    }
+
+                R.id.input_layout_stereo_horiz -> {
+                    setInputLayout(InputLayout.StereoHoriz, item)
+                    true
                 }
+
+                R.id.input_layout_stereo_vert -> {
+                    setInputLayout(InputLayout.StereoVert, item)
+                    true
+                }
+
+                R.id.input_layout_anaglyph_red_cyan -> {
+                    setInputLayout(InputLayout.AnaglyphRedCyan, item)
+                    true
+                }
+
+                R.id.input_mode_plain_fov -> {
+                    setInputMode(InputMode.PlainFov, item)
+                    true
+                }
+
+                R.id.input_mode_equirect_180 -> {
+                    setInputMode(InputMode.Equirect180, item)
+                    true
+                }
+
+                R.id.input_mode_equirect_360 -> {
+                    setInputMode(InputMode.Equirect360, item)
+                    true
+                }
+
+                R.id.input_mode_panorama_180 -> {
+                    setInputMode(InputMode.Panorama180, item)
+                    true
+                }
+
+                R.id.input_mode_panorama_360 -> {
+                    setInputMode(InputMode.Panorama360, item)
+                    true
+                }
+
+                R.id.output_mode_mono_left_eye -> {
+                    setOutputMode(OutputMode.MonoLeft, item)
+                    true
+                }
+
+                R.id.output_mode_mono_right_eye -> {
+                    setOutputMode(OutputMode.MonoRight, item)
+                    true
+                }
+
+                R.id.output_mode_cardboard -> {
+                    setOutputMode(OutputMode.CardboardStereo, item)
+                    true
+                }
+
+                else -> false
             }
         }
 
-        return null
+        popup.show()
     }
 
     private fun radiusToFov(radius: Float): Float {
@@ -457,6 +383,10 @@ class MainActivity : AppCompatActivity(),
             "lookAtFromServer RECEIVED yaw=$yaw pitch=$pitch radius=$radius fov=$fov duration=$duration"
         )
 
+        /*
+         * Важно: Renderer живёт на GL-потоке GLSurfaceView.
+         * Поэтому команду поворота отправляем через queueEvent.
+         */
         glView.queueEvent {
             if (nativeApp != 0L) {
                 Log.d(
@@ -520,6 +450,180 @@ class MainActivity : AppCompatActivity(),
         }
     }
 
+    private fun setInputLayout(newLayout: InputLayout, menuItem: MenuItem) {
+        if (newLayout == inputLayout) return
+        inputLayout = newLayout
+        setNativeOptionsOnGlThread()
+        menuItem.isChecked = true
+        Log.d(TAG, "setInputLayout: $inputLayout")
+    }
+
+    private fun setInputMode(newMode: InputMode, menuItem: MenuItem) {
+        if (newMode == inputMode) return
+        inputMode = newMode
+        setNativeOptionsOnGlThread()
+        menuItem.isChecked = true
+        Log.d(TAG, "setInputMode: $inputMode")
+    }
+
+    private fun setOutputMode(newMode: OutputMode, menuItem: MenuItem) {
+        if (newMode == outputMode) return
+        outputMode = newMode
+        setNativeOptionsOnGlThread()
+        menuItem.isChecked = true
+        Log.d(TAG, "setOutputMode: $outputMode")
+    }
+
+    private fun setNativeOptionsOnGlThread() {
+        if (nativeApp == 0L || !::glView.isInitialized) return
+
+        glView.queueEvent {
+            if (nativeApp != 0L) {
+                NativeLibrary.nativeSetOptions(
+                    nativeApp,
+                    inputLayout.ordinal,
+                    inputMode.ordinal,
+                    outputMode.ordinal
+                )
+
+                Log.d(TAG, "setNativeOptionsOnGlThread: $inputLayout $inputMode $outputMode")
+            }
+        }
+    }
+
+
+    /**
+     * Показать текстовую метку не поверх Android-экрана, а внутри VR-сферы.
+     *
+     * Алгоритм:
+     * 1. Kotlin рисует текст в Bitmap.
+     * 2. Пиксели Bitmap передаются в C++ через JNI.
+     * 3. Renderer.cpp создаёт OpenGL-текстуру и рисует её как прямоугольник
+     *    внутри сферы в точке x/y/z или yaw/pitch.
+     */
+    private fun showTextMarkInsideSphere(mark: ServerTextMark) {
+        if (nativeApp == 0L) {
+            Log.w(TAG, "showTextMarkInsideSphere ignored: nativeApp=0")
+            return
+        }
+
+        if (!::glView.isInitialized) {
+            Log.w(TAG, "showTextMarkInsideSphere ignored: glView not initialized")
+            return
+        }
+
+        val bitmapWidth = mark.width.coerceIn(160, 1024)
+        val bitmapHeight = mark.height.coerceIn(80, 512)
+        val bitmap = createTextMarkBitmap(
+            text = mark.text,
+            width = bitmapWidth,
+            height = bitmapHeight
+        )
+
+        val pixels = IntArray(bitmapWidth * bitmapHeight)
+        bitmap.getPixels(pixels, 0, bitmapWidth, 0, 0, bitmapWidth, bitmapHeight)
+        bitmap.recycle()
+
+        val x = mark.x ?: Float.NaN
+        val y = mark.y ?: Float.NaN
+        val z = mark.z ?: Float.NaN
+        val yaw = mark.yaw ?: Float.NaN
+        val pitch = mark.pitch ?: Float.NaN
+        val duration = mark.durationMs.coerceAtLeast(500)
+
+        Log.d(
+            TAG,
+            "showTextMarkInsideSphere id=${mark.id} text=${mark.text} x=$x y=$y z=$z yaw=$yaw pitch=$pitch duration=$duration"
+        )
+
+        glView.queueEvent {
+            if (nativeApp != 0L) {
+                NativeLibrary.nativeShowTextMark(
+                    nativeApp,
+                    pixels,
+                    bitmapWidth,
+                    bitmapHeight,
+                    x,
+                    y,
+                    z,
+                    yaw,
+                    pitch,
+                    bitmapWidth.toFloat(),
+                    bitmapHeight.toFloat(),
+                    duration
+                )
+            }
+        }
+    }
+
+    /**
+     * Скрыть все текстовые метки внутри сферы.
+     */
+    private fun clearTextMarksInsideSphere() {
+        if (nativeApp == 0L || !::glView.isInitialized) return
+
+        glView.queueEvent {
+            if (nativeApp != 0L) {
+                NativeLibrary.nativeClearTextMarks(nativeApp)
+            }
+        }
+    }
+
+    /**
+     * Создать bitmap с чёрным полупрозрачным прямоугольником и белым текстом.
+     * Этот bitmap потом станет OpenGL-текстурой внутри сферы.
+     */
+    private fun createTextMarkBitmap(text: String, width: Int, height: Int): Bitmap {
+        val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(bitmap)
+
+        val backgroundPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.argb(220, 0, 0, 0)
+            style = Paint.Style.FILL
+        }
+
+        val borderPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.argb(230, 255, 255, 255)
+            style = Paint.Style.STROKE
+            strokeWidth = 3f
+        }
+
+        val rect = RectF(0f, 0f, width.toFloat(), height.toFloat())
+        canvas.drawRoundRect(rect, 18f, 18f, backgroundPaint)
+        canvas.drawRoundRect(rect.insetCopy(2f), 18f, 18f, borderPaint)
+
+        val padding = 22
+        val textPaint = TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.WHITE
+            textSize = when {
+                height <= 100 -> 24f
+                height <= 160 -> 30f
+                else -> 36f
+            }
+            textAlign = Paint.Align.LEFT
+        }
+
+        val textWidth = width - padding * 2
+        val staticLayout = StaticLayout.Builder
+            .obtain(text, 0, text.length, textPaint, textWidth)
+            .setAlignment(Layout.Alignment.ALIGN_CENTER)
+            .setLineSpacing(0f, 1.0f)
+            .setIncludePad(false)
+            .build()
+
+        val textTop = ((height - staticLayout.height) / 2).coerceAtLeast(padding)
+        canvas.save()
+        canvas.translate(padding.toFloat(), textTop.toFloat())
+        staticLayout.draw(canvas)
+        canvas.restore()
+
+        return bitmap
+    }
+
+    private fun RectF.insetCopy(value: Float): RectF {
+        return RectF(left + value, top + value, right - value, bottom - value)
+    }
+
     override fun onResume() {
         super.onResume()
 
@@ -543,13 +647,11 @@ class MainActivity : AppCompatActivity(),
 
         glView.onResume()
         videoTexturePlayer.onResume()
-        startCurrentVideoInfoPolling()
     }
 
     override fun onPause() {
         Log.d(TAG, "onPause()")
 
-        stopCurrentVideoInfoPolling()
         sensorManager.unregisterListener(this)
         videoTexturePlayer.onPause()
 
@@ -563,8 +665,6 @@ class MainActivity : AppCompatActivity(),
 
     override fun onDestroy() {
         Log.d(TAG, "onDestroy()")
-
-        stopCurrentVideoInfoPolling()
 
         teacherControlClient?.stop()
         teacherControlClient = null
@@ -634,7 +734,7 @@ class MainActivity : AppCompatActivity(),
 
         /*
          * Для CardboardStereo Renderer.cpp использует CardboardHeadTracker.
-         * Этот вызов нужен как fallback для MonoLeft/MonoRight.
+         * Это останется fallback для MonoLeft/MonoRight.
          */
         NativeLibrary.nativeSetManualRotation(
             nativeApp,
